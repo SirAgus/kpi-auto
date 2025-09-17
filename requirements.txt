@@ -1,0 +1,6 @@
+slack_sdk==3.33.3
+pandas==2.2.2
+openpyxl==3.1.5
+msal==1.31.0
+python-dateutil==2.9.0.post0
+tzdata==2025.1
