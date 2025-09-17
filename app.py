@@ -13,7 +13,7 @@ channel_id=os.environ["SLACK_CHANNEL_ID"]
 client_id=os.environ["AZURE_CLIENT_ID"]
 refresh_token=os.environ["GRAPH_REFRESH_TOKEN"]
 onedrive_upn=os.environ["ONEDRIVE_UPN"]
-onedrive_file_path=os.environ.get("ONEDRIVE_FILE_PATH","/Documents/KPI MQ.xlsx")
+onedrive_file_path=os.environ.get("ONEDRIVE_FILE_PATH","/Documents/BlackBox.xlsx")
 target_hour_local=int(os.environ.get("TARGET_HOUR_LOCAL","19"))
 dev_team_member_ids=[i.strip() for i in os.environ.get("DEV_TEAM_MEMBER_IDS","").split(",") if i.strip()]
 debug_mode=os.environ.get("DEBUG_MODE","0")=="1"
@@ -47,6 +47,10 @@ def gput(url,token,data,content_type):
     r=requests.put(url,headers={"Authorization":f"Bearer {token}","Content-Type":content_type},data=data)
     if r.status_code>=400:
         print(f"[ERROR] Error en PUT: {r.status_code} - {r.text}")
+        # No lanzar excepción para errores 423 (archivo bloqueado) o 409 (conflicto)
+        if r.status_code in [423, 409]:
+            print(f"[WARN] Archivo bloqueado o en conflicto, continuando...")
+            return r
         raise RuntimeError("put")
     return r
 
@@ -75,14 +79,44 @@ def up_excel(token,bio):
     try:
         gput(url,token,bio.getvalue(),"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         print(f"[INFO] Archivo subido exitosamente a OneDrive")
+        return True
     except Exception as e:
         print(f"[ERROR] Error al subir archivo: {e}")
-        # Guardar archivo localmente como respaldo
-        backup_filename = f"backup_kpi_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        with open(backup_filename, 'wb') as f:
-            f.write(bio.getvalue())
-        print(f"[INFO] Archivo guardado localmente como respaldo: {backup_filename}")
-        raise
+        
+        # Si el archivo está bloqueado (423) o en conflicto (409), crear una copia con timestamp
+        if "423" in str(e) or "409" in str(e):
+            try:
+                # Crear nombre de archivo con timestamp
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                # Obtener el directorio y nombre base del archivo original
+                base_path = onedrive_file_path.rsplit('/', 1)[0] if '/' in onedrive_file_path else ""
+                base_name = onedrive_file_path.rsplit('/', 1)[-1].rsplit('.', 1)[0] if '.' in onedrive_file_path else onedrive_file_path
+                extension = onedrive_file_path.rsplit('.', 1)[-1] if '.' in onedrive_file_path else "xlsx"
+                
+                # Crear nueva ruta con timestamp
+                backup_path = f"{base_path}/{base_name}_backup_{timestamp}.{extension}" if base_path else f"{base_name}_backup_{timestamp}.{extension}"
+                backup_url = f"https://graph.microsoft.com/v1.0/users/{onedrive_upn}/drive/root:{backup_path}:/content"
+                
+                # Subir la copia
+                gput(backup_url, token, bio.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                print(f"[INFO] Archivo bloqueado - copia creada en OneDrive: {backup_path}")
+                return True
+                
+            except Exception as backup_error:
+                print(f"[ERROR] Error al crear copia en OneDrive: {backup_error}")
+        
+        # Guardar archivo localmente como respaldo adicional
+        backup_filename = f"backup_blackbox_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        try:
+            with open(backup_filename, 'wb') as f:
+                f.write(bio.getvalue())
+            print(f"[INFO] Archivo guardado localmente como respaldo: {backup_filename}")
+        except Exception as backup_error:
+            print(f"[WARN] No se pudo guardar respaldo local: {backup_error}")
+        
+        # No lanzar excepción, solo reportar el error
+        print(f"[WARN] Continuando sin subir a OneDrive debido al error")
+        return False
 
 def fetch_messages(oldest=None, latest=None):
     c=WebClient(token=slack_bot_token)
@@ -113,10 +147,29 @@ def build_df(msgs):
             continue
         dt=tz_dt(m.get("ts"))
         origen="Producto" if uid in dev_team_member_ids else "Otras áreas"
+        
+        # Crear enlace clickeable al mensaje de Slack
+        ts = m.get("ts", "")
+        # Formatear timestamp correctamente para Slack (formato: p1234567890123456)
+        ts_formatted = ts.replace('.', '')
+        slack_link = f"https://mq-sede.slack.com/archives/{channel_id}/p{ts_formatted}"
+        slack_text = m.get("text", "")
+        
+        # Limpiar texto para evitar caracteres problemáticos en Excel
+        if slack_text:
+            # Escapar comillas y caracteres especiales
+            clean_text = slack_text.replace('"', '""').replace('\n', ' ').replace('\r', ' ')
+            # Limitar longitud del texto para evitar problemas
+            if len(clean_text) > 200:
+                clean_text = clean_text[:197] + "..."
+            slack_content = f'=HYPERLINK("{slack_link}","{clean_text}")'
+        else:
+            slack_content = ""
+        
         datos.append({
             "Fecha aproximada":dt.strftime("%Y-%m-%d %H:%M:%S"),
             "Origen":origen,
-            "SLACK":m.get("text",""),
+            "SLACK":slack_content,
             "Diagnóstico causa raíz":"",
             "Propuesta (Tarea en ClickUp cuando sea desarrollable /Cambio sistema)":"",
             "ESTADO FINAL":""
@@ -139,54 +192,65 @@ def apply_table_style(ws, num_rows):
     if num_rows <= 1:  # Solo header o sin datos
         return
     
-    # Definir estilos
-    header_font = Font(bold=True, color="FFFFFF", size=11)
-    header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
-    header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-    
-    data_font = Font(size=10)
-    data_alignment = Alignment(vertical="top", wrap_text=True)
-    
-    # Borde para todas las celdas
-    thin_border = Border(
-        left=Side(style='thin'),
-        right=Side(style='thin'),
-        top=Side(style='thin'),
-        bottom=Side(style='thin')
-    )
-    
-    # Aplicar estilo al header (fila 1)
-    for col in range(1, ws.max_column + 1):
-        cell = ws.cell(row=1, column=col)
-        cell.font = header_font
-        cell.fill = header_fill
-        cell.alignment = header_alignment
-        cell.border = thin_border
-    
-    # Aplicar estilo a las filas de datos
-    for row in range(2, num_rows + 1):
-        for col in range(1, ws.max_column + 1):
-            cell = ws.cell(row=row, column=col)
-            cell.font = data_font
-            cell.alignment = data_alignment
+    try:
+        # Definir estilos
+        header_font = Font(bold=True, color="FFFFFF", size=12)
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+        header_alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        
+        data_font = Font(size=11)
+        data_alignment = Alignment(vertical="top", wrap_text=True)
+        
+        # Borde para todas las celdas
+        thin_border = Border(
+            left=Side(style='thin', color='000000'),
+            right=Side(style='thin', color='000000'),
+            top=Side(style='thin', color='000000'),
+            bottom=Side(style='thin', color='000000')
+        )
+        
+        # Aplicar estilo al header (fila 1)
+        for col in range(1, min(ws.max_column + 1, 7)):  # Limitar a 6 columnas
+            cell = ws.cell(row=1, column=col)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = header_alignment
             cell.border = thin_border
-    
-    # Ajustar ancho de columnas
-    column_widths = {
-        'A': 20,  # Fecha aproximada
-        'B': 15,  # Origen
-        'C': 50,  # SLACK
-        'D': 30,  # Diagnóstico causa raíz
-        'E': 40,  # Propuesta
-        'F': 20   # ESTADO FINAL
-    }
-    
-    for col_letter, width in column_widths.items():
-        ws.column_dimensions[col_letter].width = width
-    
-    # Ajustar altura de filas
-    for row in range(1, num_rows + 1):
-        ws.row_dimensions[row].height = 30
+        
+        # Aplicar estilo a las filas de datos
+        for row in range(2, min(num_rows + 1, ws.max_row + 1)):
+            for col in range(1, min(ws.max_column + 1, 7)):  # Limitar a 6 columnas
+                cell = ws.cell(row=row, column=col)
+                cell.font = data_font
+                cell.alignment = data_alignment
+                cell.border = thin_border
+        
+        # Ajustar ancho de columnas (valores más grandes para evitar tablas pequeñas)
+        column_widths = {
+            'A': 25,  # Fecha aproximada
+            'B': 18,  # Origen
+            'C': 60,  # SLACK
+            'D': 35,  # Diagnóstico causa raíz
+            'E': 45,  # Propuesta
+            'F': 25   # ESTADO FINAL
+        }
+        
+        for col_letter, width in column_widths.items():
+            ws.column_dimensions[col_letter].width = width
+        
+        # Ajustar altura de filas (altura más grande para mejor legibilidad)
+        max_rows = min(num_rows, 200)  # Aumentar límite
+        for row in range(1, max_rows + 1):
+            ws.row_dimensions[row].height = 40  # Aumentar altura de filas
+        
+        # Asegurar que el zoom esté al 100%
+        ws.sheet_view.zoomScale = 100
+        
+        print(f"[INFO] Estilo aplicado: {max_rows} filas, columnas ajustadas")
+            
+    except Exception as e:
+        print(f"[WARN] Error aplicando estilo: {e}")
+        # Continuar sin estilo si hay problemas
 
 def append_rows(wb,df):
     if df.empty:
@@ -198,32 +262,66 @@ def append_rows(wb,df):
     if hoja not in wb.sheetnames:
         ws=wb.create_sheet(title=hoja)
         ws.append(list(df.columns))
+        # Aplicar estilo inmediatamente al crear nueva hoja
+        apply_table_style(ws, 1)
+        print(f"[INFO] Nueva hoja '{hoja}' creada con estilo")
     else:
         ws=wb[hoja]
         if ws.max_row==1 and [c.value for c in ws[1]]!=list(df.columns):
             ws.delete_rows(1,ws.max_row)
             ws.append(list(df.columns))
+            # Aplicar estilo cuando se recrea el header
+            apply_table_style(ws, 1)
+            print(f"[INFO] Header de hoja '{hoja}' recreado con estilo")
     
     # Obtener mensajes existentes para verificar duplicados
     existing_messages = set()
     if ws.max_row > 1:  # Si hay datos además del header
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
             if len(row) >= 3 and row[2]:  # SLACK column (índice 2)
-                existing_messages.add(str(row[2]).strip())
+                # Extraer solo el texto del mensaje de la fórmula HYPERLINK
+                slack_content = str(row[2]).strip()
+                if slack_content.startswith('=HYPERLINK('):
+                    # Extraer el texto entre las comillas del HYPERLINK
+                    try:
+                        text_start = slack_content.find('","') + 3
+                        text_end = slack_content.rfind('")')
+                        if text_start > 2 and text_end > text_start:
+                            message_text = slack_content[text_start:text_end]
+                            existing_messages.add(message_text)
+                    except:
+                        existing_messages.add(slack_content)
+                else:
+                    existing_messages.add(slack_content)
     
     # Agregar solo mensajes nuevos
     new_rows_added = 0
     for _,r in df.iterrows():
-        slack_message = str(r["SLACK"]).strip()
-        if slack_message and slack_message not in existing_messages:
-            ws.append(list(r.values))
-            existing_messages.add(slack_message)
-            new_rows_added += 1
+        slack_content = str(r["SLACK"]).strip()
+        if slack_content:
+            # Extraer texto del mensaje para comparación
+            if slack_content.startswith('=HYPERLINK('):
+                try:
+                    text_start = slack_content.find('","') + 3
+                    text_end = slack_content.rfind('")')
+                    if text_start > 2 and text_end > text_start:
+                        message_text = slack_content[text_start:text_end]
+                    else:
+                        message_text = slack_content
+                except:
+                    message_text = slack_content
+            else:
+                message_text = slack_content
+            
+            if message_text and message_text not in existing_messages:
+                ws.append(list(r.values))
+                existing_messages.add(message_text)
+                new_rows_added += 1
     
     print(f"[INFO] Filas nuevas agregadas: {new_rows_added} (duplicados ignorados: {len(df) - new_rows_added})")
     
-    # Aplicar estilo a la tabla
-    if new_rows_added > 0:
+    # Aplicar estilo a la tabla siempre (incluso si no hay filas nuevas)
+    if ws.max_row > 1:  # Si hay datos además del header
         apply_table_style(ws, ws.max_row)
         print(f"[INFO] Estilo aplicado a la tabla")
     
@@ -239,6 +337,7 @@ def main():
 
     first_run_flag=".first_run_done"
     if not os.path.exists(first_run_flag):
+        # Primera ejecución: desde 11 de septiembre hasta ahora
         start_dt=datetime(2025,9,11,tzinfo=timezone.utc)
         oldest=str(start_dt.timestamp())
         latest=str(datetime.now(tz=timezone.utc).timestamp())
@@ -249,8 +348,17 @@ def main():
         if not (should_run() or debug_mode):
             print(f"[INFO] No es hora ({now_scl().hour}), ni debug, saliendo")
             return
-        print("[INFO] Buscando mensajes recientes en Slack")
-        msgs=fetch_messages()
+        
+        # Ejecuciones posteriores: solo del día actual
+        now_utc = datetime.now(tz=timezone.utc)
+        start_of_day = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_day = now_utc.replace(hour=23, minute=59, second=59, microsecond=999999)
+        
+        oldest=str(start_of_day.timestamp())
+        latest=str(end_of_day.timestamp())
+        
+        print(f"[INFO] Ejecución diaria: desde {start_of_day.astimezone(ZoneInfo('America/Santiago'))} hasta {end_of_day.astimezone(ZoneInfo('America/Santiago'))}")
+        msgs=fetch_messages(oldest=oldest, latest=latest)
 
     print(f"[INFO] Mensajes obtenidos: {len(msgs)}")
     df=build_df(msgs)
@@ -277,8 +385,13 @@ def main():
     out=io.BytesIO()
     wb.save(out)
     out.seek(0)
-    up_excel(token,out)
-    print(f"[INFO] Excel actualizado en OneDrive: {onedrive_file_path}")
+    
+    # Intentar subir a OneDrive
+    upload_success = up_excel(token,out)
+    if upload_success:
+        print(f"[INFO] Excel actualizado en OneDrive: {onedrive_file_path}")
+    else:
+        print(f"[WARN] No se pudo actualizar OneDrive, pero el procesamiento se completó exitosamente")
 
     print(f"[INFO] Fin ejecución: {now_scl()}")
 
