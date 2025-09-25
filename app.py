@@ -1,4 +1,5 @@
 import os, io, requests, pandas as pd
+from datetime import timedelta
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 from datetime import datetime, timezone
@@ -14,16 +15,14 @@ client_id=os.environ["AZURE_CLIENT_ID"]
 refresh_token=os.environ["GRAPH_REFRESH_TOKEN"]
 onedrive_upn=os.environ["ONEDRIVE_UPN"]
 onedrive_file_path=os.environ.get("ONEDRIVE_FILE_PATH","/Documents/BlackBox.xlsx")
-target_hour_local=int(os.environ.get("TARGET_HOUR_LOCAL","19"))
+# target_hour_local eliminado - ya no se usa restricción de hora
 dev_team_member_ids=[i.strip() for i in os.environ.get("DEV_TEAM_MEMBER_IDS","").split(",") if i.strip()]
 debug_mode=os.environ.get("DEBUG_MODE","0")=="1"
 
 def now_scl():
     return datetime.now(tz=ZoneInfo("America/Santiago"))
 
-def should_run():
-    n=now_scl()
-    return n.hour==target_hour_local
+# Función should_run() eliminada - ya no se usa restricción de hora
 
 def acquire_token():
     data={
@@ -345,20 +344,38 @@ def main():
         msgs=fetch_messages(oldest=oldest, latest=latest)
         open(first_run_flag,"w").close()
     else:
-        if not (should_run() or debug_mode):
-            print(f"[INFO] No es hora ({now_scl().hour}), ni debug, saliendo")
-            return
+        # Ejecutar siempre, sin restricción de hora
+        print(f"[INFO] Ejecutando sin restricción de hora (debug_mode: {debug_mode})")
         
-        # Ejecuciones posteriores: solo del día actual
+        # Ejecuciones posteriores: día actual + día anterior
         now_utc = datetime.now(tz=timezone.utc)
-        start_of_day = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_of_day = now_utc.replace(hour=23, minute=59, second=59, microsecond=999999)
+        now_scl_tz = now_utc.astimezone(ZoneInfo("America/Santiago"))
         
-        oldest=str(start_of_day.timestamp())
-        latest=str(end_of_day.timestamp())
+        # Día actual: desde las 00:00 hasta ahora
+        start_of_today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+        end_of_today = now_utc
         
-        print(f"[INFO] Ejecución diaria: desde {start_of_day.astimezone(ZoneInfo('America/Santiago'))} hasta {end_of_day.astimezone(ZoneInfo('America/Santiago'))}")
-        msgs=fetch_messages(oldest=oldest, latest=latest)
+        # Día anterior: desde las 00:00 hasta las 23:59:59
+        yesterday_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+        start_of_yesterday = yesterday_utc
+        end_of_yesterday = yesterday_utc.replace(hour=23, minute=59, second=59, microsecond=999999)
+        
+        # Obtener mensajes de ambos días
+        oldest_today = str(start_of_today.timestamp())
+        latest_today = str(end_of_today.timestamp())
+        
+        oldest_yesterday = str(start_of_yesterday.timestamp())
+        latest_yesterday = str(end_of_yesterday.timestamp())
+        
+        print(f"[INFO] Ejecución diaria: verificando día actual ({start_of_today.astimezone(ZoneInfo('America/Santiago'))} hasta {end_of_today.astimezone(ZoneInfo('America/Santiago'))}) y día anterior ({start_of_yesterday.astimezone(ZoneInfo('America/Santiago'))} hasta {end_of_yesterday.astimezone(ZoneInfo('America/Santiago'))})")
+        
+        # Obtener mensajes de ambos períodos
+        msgs_today = fetch_messages(oldest=oldest_today, latest=latest_today)
+        msgs_yesterday = fetch_messages(oldest=oldest_yesterday, latest=latest_yesterday)
+        
+        # Combinar mensajes de ambos días
+        msgs = msgs_today + msgs_yesterday
+        print(f"[INFO] Mensajes del día actual: {len(msgs_today)}, del día anterior: {len(msgs_yesterday)}, total: {len(msgs)}")
 
     print(f"[INFO] Mensajes obtenidos: {len(msgs)}")
     df=build_df(msgs)
