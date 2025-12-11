@@ -8,6 +8,7 @@ from openpyxl import load_workbook
 from openpyxl.workbook import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import msal
+import re
 
 slack_bot_token=os.environ["SLACK_BOT_TOKEN"]
 channel_id=os.environ["SLACK_CHANNEL_ID"]
@@ -25,16 +26,66 @@ def now_scl():
 # Función should_run() eliminada - ya no se usa restricción de hora
 
 def acquire_token():
-    data={
-        "client_id":client_id,
-        "refresh_token":refresh_token,
-        "grant_type":"refresh_token",
-        "scope":"offline_access Files.ReadWrite"
+    tenant = os.environ.get("AZURE_TENANT", "consumers").strip() or "consumers"
+    token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+
+    if not client_id or not refresh_token:
+        raise RuntimeError("token: faltan variables de entorno AZURE_CLIENT_ID o GRAPH_REFRESH_TOKEN")
+
+    # Para refresh_token en v2.0, el parámetro scope es opcional; si se incluye, debe ser subconjunto del original.
+    # Intentamos primero con scope (comportamiento actual) y, si falla con error de scope, reintentamos sin scope.
+    base_data = {
+        "client_id": client_id,
+        "refresh_token": refresh_token,
+        "grant_type": "refresh_token",
     }
-    r=requests.post("https://login.microsoftonline.com/consumers/oauth2/v2.0/token",data=data)
-    if r.status_code>=400:
-        raise RuntimeError("token")
-    return r.json()["access_token"]
+    attempts = [
+        {**base_data, "scope": "offline_access Files.ReadWrite"},
+        base_data,
+    ]
+
+    last_err = None
+    for data in attempts:
+        try:
+            r = requests.post(token_url, data=data, timeout=30)
+        except requests.RequestException as e:
+            last_err = f"token: error de red llamando a {token_url}: {e}"
+            continue
+
+        if r.status_code < 400:
+            try:
+                payload = r.json()
+            except ValueError:
+                raise RuntimeError(f"token: respuesta no-JSON (status {r.status_code}) desde {token_url}: {r.text[:500]}")
+
+            access_token = payload.get("access_token")
+            if not access_token:
+                raise RuntimeError(f"token: respuesta sin access_token desde {token_url}: {str(payload)[:800]}")
+            return access_token
+
+        # Error HTTP: extraer detalles (sin imprimir secretos)
+        try:
+            err = r.json()
+        except ValueError:
+            err = {"raw": r.text[:1000]}
+
+        error_code = err.get("error") or "unknown_error"
+        error_desc = err.get("error_description") or err.get("raw") or ""
+        request_id = r.headers.get("request-id") or r.headers.get("x-ms-request-id") or r.headers.get("client-request-id") or ""
+
+        last_err = (
+            "token: fallo al refrescar access token "
+            f"(tenant={tenant}, status={r.status_code}, error={error_code})"
+            + (f", request_id={request_id}" if request_id else "")
+            + (f": {error_desc}" if error_desc else "")
+        )
+
+        # Si el error sugiere un problema de scope, probamos el siguiente intento (sin scope).
+        if error_code in {"invalid_scope"} or "scope" in str(error_desc).lower():
+            continue
+        break
+
+    raise RuntimeError(last_err or "token: fallo desconocido al refrescar access token")
 
 def gget(url,token):
     r=requests.get(url,headers={"Authorization":f"Bearer {token}"})
@@ -176,6 +227,21 @@ def build_df(msgs):
     cols=["Fecha aproximada","Origen","SLACK","Diagnóstico causa raíz","Propuesta (Tarea en ClickUp cuando sea desarrollable /Cambio sistema)","ESTADO FINAL"]
     return pd.DataFrame(datos,columns=cols) if datos else pd.DataFrame(columns=cols)
 
+def extract_hyperlink_url(cell_value):
+    """
+    Extrae la URL de una fórmula de Excel del tipo:
+    =HYPERLINK("url","texto")
+    Si no aplica o falla, retorna None.
+    """
+    if cell_value is None:
+        return None
+    s = str(cell_value).strip()
+    if not s.startswith("=HYPERLINK("):
+        return None
+    # Captura la primera cadena entre comillas (la URL)
+    m = re.match(r'^=HYPERLINK\("([^"]+)"\s*,', s)
+    return m.group(1) if m else None
+
 def get_month_name_from_period(df):
     """Obtiene el nombre del mes del primer día del período"""
     if df.empty:
@@ -273,48 +339,24 @@ def append_rows(wb,df):
             apply_table_style(ws, 1)
             print(f"[INFO] Header de hoja '{hoja}' recreado con estilo")
     
-    # Obtener mensajes existentes para verificar duplicados
-    existing_messages = set()
+    # Obtener claves existentes para verificar duplicados (preferimos URL del mensaje de Slack)
+    existing_keys = set()
     if ws.max_row > 1:  # Si hay datos además del header
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
             if len(row) >= 3 and row[2]:  # SLACK column (índice 2)
-                # Extraer solo el texto del mensaje de la fórmula HYPERLINK
                 slack_content = str(row[2]).strip()
-                if slack_content.startswith('=HYPERLINK('):
-                    # Extraer el texto entre las comillas del HYPERLINK
-                    try:
-                        text_start = slack_content.find('","') + 3
-                        text_end = slack_content.rfind('")')
-                        if text_start > 2 and text_end > text_start:
-                            message_text = slack_content[text_start:text_end]
-                            existing_messages.add(message_text)
-                    except:
-                        existing_messages.add(slack_content)
-                else:
-                    existing_messages.add(slack_content)
+                url = extract_hyperlink_url(slack_content)
+                existing_keys.add(url or slack_content)
     
     # Agregar solo mensajes nuevos
     new_rows_added = 0
     for _,r in df.iterrows():
         slack_content = str(r["SLACK"]).strip()
         if slack_content:
-            # Extraer texto del mensaje para comparación
-            if slack_content.startswith('=HYPERLINK('):
-                try:
-                    text_start = slack_content.find('","') + 3
-                    text_end = slack_content.rfind('")')
-                    if text_start > 2 and text_end > text_start:
-                        message_text = slack_content[text_start:text_end]
-                    else:
-                        message_text = slack_content
-                except:
-                    message_text = slack_content
-            else:
-                message_text = slack_content
-            
-            if message_text and message_text not in existing_messages:
+            key = extract_hyperlink_url(slack_content) or slack_content
+            if key and key not in existing_keys:
                 ws.append(list(r.values))
-                existing_messages.add(message_text)
+                existing_keys.add(key)
                 new_rows_added += 1
     
     print(f"[INFO] Filas nuevas agregadas: {new_rows_added} (duplicados ignorados: {len(df) - new_rows_added})")
@@ -334,48 +376,16 @@ def main():
 
     ensure_file(token)
 
-    first_run_flag=".first_run_done"
-    if not os.path.exists(first_run_flag):
-        # Primera ejecución: desde 11 de septiembre hasta ahora
-        start_dt=datetime(2025,9,11,tzinfo=timezone.utc)
-        oldest=str(start_dt.timestamp())
-        latest=str(datetime.now(tz=timezone.utc).timestamp())
-        print(f"[INFO] Primera corrida: desde {start_dt} hasta ahora")
-        msgs=fetch_messages(oldest=oldest, latest=latest)
-        open(first_run_flag,"w").close()
-    else:
-        # Ejecutar siempre, sin restricción de hora
-        print(f"[INFO] Ejecutando sin restricción de hora (debug_mode: {debug_mode})")
-        
-        # Ejecuciones posteriores: día actual + día anterior
-        now_utc = datetime.now(tz=timezone.utc)
-        now_scl_tz = now_utc.astimezone(ZoneInfo("America/Santiago"))
-        
-        # Día actual: desde las 00:00 hasta ahora
-        start_of_today = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-        end_of_today = now_utc
-        
-        # Día anterior: desde las 00:00 hasta las 23:59:59
-        yesterday_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
-        start_of_yesterday = yesterday_utc
-        end_of_yesterday = yesterday_utc.replace(hour=23, minute=59, second=59, microsecond=999999)
-        
-        # Obtener mensajes de ambos días
-        oldest_today = str(start_of_today.timestamp())
-        latest_today = str(end_of_today.timestamp())
-        
-        oldest_yesterday = str(start_of_yesterday.timestamp())
-        latest_yesterday = str(end_of_yesterday.timestamp())
-        
-        print(f"[INFO] Ejecución diaria: verificando día actual ({start_of_today.astimezone(ZoneInfo('America/Santiago'))} hasta {end_of_today.astimezone(ZoneInfo('America/Santiago'))}) y día anterior ({start_of_yesterday.astimezone(ZoneInfo('America/Santiago'))} hasta {end_of_yesterday.astimezone(ZoneInfo('America/Santiago'))})")
-        
-        # Obtener mensajes de ambos períodos
-        msgs_today = fetch_messages(oldest=oldest_today, latest=latest_today)
-        msgs_yesterday = fetch_messages(oldest=oldest_yesterday, latest=latest_yesterday)
-        
-        # Combinar mensajes de ambos días
-        msgs = msgs_today + msgs_yesterday
-        print(f"[INFO] Mensajes del día actual: {len(msgs_today)}, del día anterior: {len(msgs_yesterday)}, total: {len(msgs)}")
+    # Ejecutar siempre, sin restricción de hora
+    print(f"[INFO] Ejecutando sin restricción de hora (debug_mode: {debug_mode})")
+
+    # Últimos 4 días (en horario Chile): desde 00:00 del día (hoy - 3) hasta ahora
+    now_local = now_scl()
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=3)
+    oldest = str(start_local.astimezone(timezone.utc).timestamp())
+    latest = str(datetime.now(tz=timezone.utc).timestamp())
+    print(f"[INFO] Ventana Slack últimos 4 días (hora Chile): {start_local} hasta {now_local}")
+    msgs = fetch_messages(oldest=oldest, latest=latest)
 
     print(f"[INFO] Mensajes obtenidos: {len(msgs)}")
     df=build_df(msgs)
