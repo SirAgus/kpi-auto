@@ -181,14 +181,15 @@ def acquire_token():
         # Si el error sugiere un problema de scope, probamos el siguiente intento (sin scope).
         if error_code in {"invalid_scope"} or "scope" in str(error_desc).lower():
             continue
-        # Si exige interacción (invalid_grant), intentamos device flow (cuenta personal)
-        if error_code=="invalid_grant" and (
-            "interaction is required" in str(error_desc).lower()
-            or "must sign in again" in str(error_desc).lower()
-            or "user could not be authenticated" in str(error_desc).lower()
-        ):
+        # Si el refresh token quedó inválido (invalid_grant), caemos al Device Code Flow.
+        # En cuentas personales esto puede ocurrir periódicamente y requiere re-login.
+        if error_code=="invalid_grant":
             return device_flow_token()
         break
+
+    # Fallback extra: si por algún motivo no matcheó antes, pero el último error fue invalid_grant, intentar device flow.
+    if last_err and "error=invalid_grant" in last_err:
+        return device_flow_token()
 
     raise RuntimeError(last_err or "token: fallo desconocido al refrescar access token")
 
