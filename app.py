@@ -1,7 +1,6 @@
 import os, io, requests, pandas as pd
 from datetime import timedelta
 from slack_sdk import WebClient
-from slack_sdk.errors import SlackApiError
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from openpyxl import load_workbook
@@ -28,14 +27,6 @@ def now_scl():
     return datetime.now(tz=ZoneInfo("America/Santiago"))
 
 # Función should_run() eliminada - ya no se usa restricción de hora
-
-def slack_notify(text: str):
-    """Envía un mensaje a Slack al mismo channel_id (mejor esfuerzo)."""
-    try:
-        c=WebClient(token=slack_bot_token)
-        c.chat_postMessage(channel=channel_id,text=text)
-    except Exception as e:
-        print(f"[WARN] No se pudo notificar a Slack: {e}")
 
 def load_refresh_token() -> str:
     """Lee refresh token desde archivo persistente (si existe) o desde ENV."""
@@ -87,7 +78,7 @@ def acquire_token():
         )
         print("[WARN] Se requiere re-login de Microsoft. Device Code Flow:")
         print(msg)
-        slack_notify(f"[KPI-AUTO] Se requiere reautenticación Microsoft Graph.\n{msg}\n(Expira en ~{int(flow.get('expires_in',900))//60} min)")
+        # No enviar mensajes a Slack: solo log.
 
         interval=int(flow.get("interval",5))
         deadline=time.time()+min(int(flow.get("expires_in",900)),device_flow_wait_seconds)
