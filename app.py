@@ -9,34 +9,132 @@ from openpyxl.workbook import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 import msal
 import re
+import time
 
 slack_bot_token=os.environ["SLACK_BOT_TOKEN"]
 channel_id=os.environ["SLACK_CHANNEL_ID"]
 client_id=os.environ["AZURE_CLIENT_ID"]
-refresh_token=os.environ["GRAPH_REFRESH_TOKEN"]
+refresh_token=os.environ.get("GRAPH_REFRESH_TOKEN","")
 onedrive_upn=os.environ["ONEDRIVE_UPN"]
 onedrive_file_path=os.environ.get("ONEDRIVE_FILE_PATH","/Documents/BlackBox.xlsx")
 # target_hour_local eliminado - ya no se usa restricción de hora
 dev_team_member_ids=[i.strip() for i in os.environ.get("DEV_TEAM_MEMBER_IDS","").split(",") if i.strip()]
 debug_mode=os.environ.get("DEBUG_MODE","0")=="1"
+refresh_token_path=os.environ.get("REFRESH_TOKEN_PATH","/data/graph_refresh_token")
+device_flow_wait_seconds=int(os.environ.get("DEVICE_FLOW_WAIT_SECONDS","600"))  # 10 min
+graph_scope=os.environ.get("GRAPH_SCOPE","offline_access Files.ReadWrite").strip() or "offline_access Files.ReadWrite"
 
 def now_scl():
     return datetime.now(tz=ZoneInfo("America/Santiago"))
 
 # Función should_run() eliminada - ya no se usa restricción de hora
 
+def slack_notify(text: str):
+    """Envía un mensaje a Slack al mismo channel_id (mejor esfuerzo)."""
+    try:
+        c=WebClient(token=slack_bot_token)
+        c.chat_postMessage(channel=channel_id,text=text)
+    except Exception as e:
+        print(f"[WARN] No se pudo notificar a Slack: {e}")
+
+def load_refresh_token() -> str:
+    """Lee refresh token desde archivo persistente (si existe) o desde ENV."""
+    try:
+        p=(refresh_token_path or "").strip()
+        if p and os.path.exists(p):
+            with open(p,"r",encoding="utf-8") as f:
+                t=f.read().strip()
+                if t:
+                    return t
+    except Exception as e:
+        print(f"[WARN] No se pudo leer REFRESH_TOKEN_PATH={refresh_token_path}: {e}")
+    return (os.environ.get("GRAPH_REFRESH_TOKEN","").strip() or "")
+
+def save_refresh_token(token: str):
+    """Guarda refresh token en archivo persistente para próximos runs."""
+    if not token:
+        return
+    try:
+        p=(refresh_token_path or "").strip()
+        if not p:
+            return
+        d=os.path.dirname(p)
+        if d:
+            os.makedirs(d,exist_ok=True)
+        with open(p,"w",encoding="utf-8") as f:
+            f.write(token.strip())
+        print(f"[INFO] Refresh token guardado en {p}")
+    except Exception as e:
+        print(f"[WARN] No se pudo guardar refresh token en {refresh_token_path}: {e}")
+
 def acquire_token():
     tenant = os.environ.get("AZURE_TENANT", "consumers").strip() or "consumers"
     token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
 
-    if not client_id or not refresh_token:
-        raise RuntimeError("token: faltan variables de entorno AZURE_CLIENT_ID o GRAPH_REFRESH_TOKEN")
+    if not client_id:
+        raise RuntimeError("token: falta variable de entorno AZURE_CLIENT_ID")
+
+    rt=load_refresh_token() or refresh_token
+
+    def device_flow_token():
+        device_url=f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/devicecode"
+        dc=requests.post(device_url,data={"client_id":client_id,"scope":graph_scope},timeout=30)
+        if dc.status_code>=400:
+            raise RuntimeError(f"token: devicecode falló (status={dc.status_code}): {dc.text[:1000]}")
+        flow=dc.json()
+        msg=flow.get("message") or (
+            f"Autorización requerida.\n1) Abrí {flow.get('verification_uri')}\n2) Ingresá el código: {flow.get('user_code')}"
+        )
+        print("[WARN] Se requiere re-login de Microsoft. Device Code Flow:")
+        print(msg)
+        slack_notify(f"[KPI-AUTO] Se requiere reautenticación Microsoft Graph.\n{msg}\n(Expira en ~{int(flow.get('expires_in',900))//60} min)")
+
+        interval=int(flow.get("interval",5))
+        deadline=time.time()+min(int(flow.get("expires_in",900)),device_flow_wait_seconds)
+        while time.time()<deadline:
+            time.sleep(interval)
+            tr=requests.post(
+                token_url,
+                data={
+                    "grant_type":"urn:ietf:params:oauth:grant-type:device_code",
+                    "client_id":client_id,
+                    "device_code":flow.get("device_code"),
+                },
+                timeout=30
+            )
+            if tr.status_code==200:
+                tok=tr.json()
+                new_rt=tok.get("refresh_token")
+                if new_rt:
+                    save_refresh_token(new_rt)
+                at=tok.get("access_token")
+                if not at:
+                    raise RuntimeError(f"token: device flow sin access_token: {str(tok)[:800]}")
+                return at
+
+            # Respuestas esperables mientras se autoriza
+            try:
+                err=tr.json()
+            except ValueError:
+                raise RuntimeError(f"token: device flow respuesta no-JSON (status={tr.status_code}): {tr.text[:500]}")
+            code=err.get("error")
+            if code in {"authorization_pending","slow_down"}:
+                if code=="slow_down":
+                    interval+=5
+                continue
+            raise RuntimeError(f"token: device flow falló: {err}")
+
+        raise RuntimeError("token: expiró la espera de autorización (device flow). Reintentá luego de autorizar.")
+
+    # Si no hay refresh token, necesitamos device flow sí o sí.
+    if not rt:
+        return device_flow_token()
 
     # Para refresh_token en v2.0, el parámetro scope es opcional; si se incluye, debe ser subconjunto del original.
     # Intentamos primero con scope (comportamiento actual) y, si falla con error de scope, reintentamos sin scope.
     base_data = {
         "client_id": client_id,
-        "refresh_token": refresh_token,
+        "refresh_token": rt,
         "grant_type": "refresh_token",
     }
     attempts = [
@@ -83,6 +181,13 @@ def acquire_token():
         # Si el error sugiere un problema de scope, probamos el siguiente intento (sin scope).
         if error_code in {"invalid_scope"} or "scope" in str(error_desc).lower():
             continue
+        # Si exige interacción (invalid_grant), intentamos device flow (cuenta personal)
+        if error_code=="invalid_grant" and (
+            "interaction is required" in str(error_desc).lower()
+            or "must sign in again" in str(error_desc).lower()
+            or "user could not be authenticated" in str(error_desc).lower()
+        ):
+            return device_flow_token()
         break
 
     raise RuntimeError(last_err or "token: fallo desconocido al refrescar access token")
