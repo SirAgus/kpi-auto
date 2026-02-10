@@ -632,6 +632,69 @@ def collect_existing_slack_keys(wb):
                 keys.add(url or slack_content)
     return keys
 
+def collect_existing_row_locations(wb):
+    locations={}
+    for sheet_name in wb.sheetnames:
+        ws=wb[sheet_name]
+        if ws.max_row<=1:
+            continue
+        for row_idx in range(2, ws.max_row+1):
+            slack_value=ws.cell(row=row_idx, column=3).value
+            if not slack_value:
+                continue
+            slack_content=str(slack_value).strip()
+            key=extract_hyperlink_url(slack_content) or slack_content
+            if key and key not in locations:
+                locations[key]=(sheet_name, row_idx)
+    return locations
+
+def backfill_ai_for_existing_rows(wb, msgs, existing_row_locations):
+    if not msgs or not existing_row_locations:
+        return 0, 0
+
+    slack_client=WebClient(token=slack_bot_token)
+    groq_client=create_groq_client()
+    checked=0
+    updated=0
+
+    for m in reversed(msgs):
+        uid=m.get("user")
+        ts=m.get("ts")
+        if not uid or not ts:
+            continue
+
+        _, slack_link=build_slack_hyperlink(ts, m.get("text",""))
+        key=slack_link
+        if key not in existing_row_locations:
+            continue
+
+        sheet_name, row_idx = existing_row_locations[key]
+        ws=wb[sheet_name]
+        status_cell=ws.cell(row=row_idx, column=8)
+        summary_cell=ws.cell(row=row_idx, column=9)
+        has_status=bool(str(status_cell.value or "").strip())
+        has_summary=bool(str(summary_cell.value or "").strip())
+
+        if has_status and has_summary:
+            continue
+
+        comments_for_ai=""
+        reply_count=int(m.get("reply_count",0) or 0)
+        if reply_count>0:
+            thread_ts=m.get("thread_ts") or ts
+            replies=fetch_thread_replies(slack_client, thread_ts)
+            comments_for_ai=build_comments_from_thread(replies, ts)
+
+        new_summary=normalize_ai_summary(generate_ai_summary(groq_client, m.get("text",""), comments_for_ai))
+        checked+=1
+        if new_summary and new_summary != str(summary_cell.value or "").strip():
+            summary_cell.value=new_summary
+            updated+=1
+
+    if checked:
+        print(f"[INFO] Backfill IA sobre filas existentes: revisadas={checked}, actualizadas={updated}")
+    return checked, updated
+
 def normalize_header_row(ws):
     return [str(ws.cell(row=1, column=idx).value).strip() if ws.cell(row=1, column=idx).value is not None else "" for idx in range(1, ws.max_column + 1)]
 
@@ -784,6 +847,7 @@ def main():
 
     migrated_sheets, repaired_links, ai_cleaned = migrate_and_repair_workbook(wb)
     existing_slack_keys=collect_existing_slack_keys(wb)
+    existing_row_locations=collect_existing_row_locations(wb)
     print(f"[INFO] Claves Slack ya existentes en Excel: {len(existing_slack_keys)}")
 
     # Ejecutar siempre, sin restricción de hora
@@ -798,8 +862,9 @@ def main():
     msgs = fetch_messages(oldest=oldest, latest=latest)
 
     print(f"[INFO] Mensajes obtenidos: {len(msgs)}")
+    _, backfilled_ai = backfill_ai_for_existing_rows(wb, msgs, existing_row_locations)
     df=build_df(msgs, existing_keys=existing_slack_keys)
-    workbook_changed = (migrated_sheets > 0 or repaired_links > 0 or ai_cleaned > 0)
+    workbook_changed = (migrated_sheets > 0 or repaired_links > 0 or ai_cleaned > 0 or backfilled_ai > 0)
     if not df.empty:
         print(f"[INFO] Filas a agregar: {len(df)}")
         print("[DEBUG] Preview:\n", df.head(5).to_string())
