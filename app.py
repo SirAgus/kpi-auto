@@ -466,16 +466,56 @@ def normalize_ai_summary(text):
     s=sanitize_text(s)
     return s
 
-def infer_final_status(summary):
-    s=normalize_ai_summary(summary).lower()
-    s=re.sub(r"[^a-záéíóúüñ ]+"," ",s)
+def normalize_for_status_matching(text):
+    s=sanitize_text(text).lower()
+    replacements=str.maketrans("áéíóúüñ","aeiouun")
+    s=s.translate(replacements)
+    s=re.sub(r"[^a-z0-9 ]+"," ",s)
     s=re.sub(r"\s+"," ",s).strip()
-    if "conclusión resuelto" in s or "conclusion resuelto" in s:
-        return "Resuelto"
-    if "conclusión no resuelto" in s or "conclusion no resuelto" in s:
-        return "No resuelto"
-    if "conclusión sin información suficiente" in s or "conclusion sin información suficiente" in s:
-        return "Sin información suficiente"
+    return s
+
+def is_idea_request(text):
+    s=normalize_for_status_matching(text)
+    if not s:
+        return False
+    if "lista de deseos" in s or "wishlist" in s:
+        return True
+    request_intents=("porfa", "podrian", "pueden", "me gustaria", "sugerencia", "idea", "deberian")
+    feature_actions=("agregar", "incluir", "sumar", "habilitar", "implementar", "filtro")
+    return any(i in s for i in request_intents) and any(a in s for a in feature_actions)
+
+def is_announcement_or_gratitude(text):
+    s=normalize_for_status_matching(text)
+    if not s:
+        return False
+    announcement_signals=(
+        "pasando a produccion",
+        "a produccion",
+        "novedades",
+        "nuevo en produccion",
+        "nuevos elementos",
+        "se agrego a produccion",
+        "ya esta en produccion",
+        "deploy",
+        "despliegue",
+        "gracias por su paciencia",
+    )
+    if any(sig in s for sig in announcement_signals):
+        return True
+
+    gratitude_signals=("gracias", "muchas gracias", "agradecido", "agradecida", "agradecimiento")
+    issue_signals=("error", "problema", "no funciona", "no me", "ayuda", "incidencia")
+    return (
+        any(sig in s for sig in gratitude_signals)
+        and len(s.split()) <= 14
+        and not any(sig in s for sig in issue_signals)
+    )
+
+def infer_auto_status(main_text):
+    if is_idea_request(main_text):
+        return "Estado IDEA"
+    if is_announcement_or_gratitude(main_text):
+        return "Anuncio/Agradecimiento"
     return ""
 
 def build_df(msgs, existing_keys=None):
@@ -508,7 +548,9 @@ def build_df(msgs, existing_keys=None):
             replies=fetch_thread_replies(slack_client, thread_ts)
             comments_for_ai=build_comments_from_thread(replies, ts)
 
-        resumen_ia=generate_ai_summary(groq_client, m.get("text",""), comments_for_ai)
+        main_text=m.get("text","")
+        resumen_ia=generate_ai_summary(groq_client, main_text, comments_for_ai)
+        auto_status=infer_auto_status(main_text)
 
         datos.append({
             "Fecha aproximada":dt.strftime("%Y-%m-%d %H:%M:%S"),
@@ -518,7 +560,7 @@ def build_df(msgs, existing_keys=None):
             "Comentarios":"",
             "Categoría Soporte (estandarizado para reportes)":"",
             "Propuesta (Tarea en ClickUp cuando sea desarrollable /Cambio sistema)":"",
-            "ESTADO FINAL":"",
+            "ESTADO FINAL":auto_status,
             "resumen ia":resumen_ia
         })
         known_keys.add(key)
@@ -588,22 +630,24 @@ def apply_table_style(ws, num_rows):
                 cell.alignment = data_alignment
                 cell.border = thin_border
         
-        # Ajustar ancho de columnas
-        column_widths = {
-            1: 23,  # Fecha aproximada
-            2: 18,  # Origen
-            3: 60,  # SLACK
-            4: 30,  # Funcionalidad Backend/Frontend
-            5: 65,  # Comentarios
-            6: 42,  # Categoría Soporte
-            7: 48,  # Propuesta
-            8: 22,  # ESTADO FINAL
-            9: 70   # resumen ia
+        # Ajustar ancho de columnas por nombre (robusto si el orden cambia)
+        column_widths_by_name = {
+            "Fecha aproximada": 23,
+            "Origen": 18,
+            "SLACK": 60,
+            "Funcionalidad Backend/Frontend": 30,
+            "Comentarios": 65,
+            "Categoría Soporte (estandarizado para reportes)": 42,
+            "Propuesta (Tarea en ClickUp cuando sea desarrollable /Cambio sistema)": 48,
+            "ESTADO FINAL": 22,
+            "resumen ia": 70
         }
-        
-        for col_index, width in column_widths.items():
-            col_letter = get_column_letter(col_index)
-            ws.column_dimensions[col_letter].width = width
+        headers=normalize_header_row(ws)
+        for idx, header in enumerate(headers, start=1):
+            width=column_widths_by_name.get(header)
+            if width is not None:
+                col_letter = get_column_letter(idx)
+                ws.column_dimensions[col_letter].width = width
         
         # Ajustar altura de filas
         max_rows = min(num_rows, 200)
@@ -625,9 +669,12 @@ def collect_existing_slack_keys(wb):
         ws=wb[sheet_name]
         if ws.max_row<=1:
             continue
+        slack_col=get_column_index(ws, "SLACK", fallback=3)
+        if slack_col is None:
+            continue
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
-            if len(row)>=3 and row[2]:
-                slack_content=str(row[2]).strip()
+            if len(row)>=slack_col and row[slack_col-1]:
+                slack_content=str(row[slack_col-1]).strip()
                 url=extract_hyperlink_url(slack_content)
                 keys.add(url or slack_content)
     return keys
@@ -638,8 +685,11 @@ def collect_existing_row_locations(wb):
         ws=wb[sheet_name]
         if ws.max_row<=1:
             continue
+        slack_col=get_column_index(ws, "SLACK", fallback=3)
+        if slack_col is None:
+            continue
         for row_idx in range(2, ws.max_row+1):
-            slack_value=ws.cell(row=row_idx, column=3).value
+            slack_value=ws.cell(row=row_idx, column=slack_col).value
             if not slack_value:
                 continue
             slack_content=str(slack_value).strip()
@@ -650,12 +700,13 @@ def collect_existing_row_locations(wb):
 
 def backfill_ai_for_existing_rows(wb, msgs, existing_row_locations):
     if not msgs or not existing_row_locations:
-        return 0, 0
+        return 0, 0, 0
 
     slack_client=WebClient(token=slack_bot_token)
     groq_client=create_groq_client()
     checked=0
-    updated=0
+    summary_updated=0
+    status_updated=0
 
     for m in reversed(msgs):
         uid=m.get("user")
@@ -670,12 +721,26 @@ def backfill_ai_for_existing_rows(wb, msgs, existing_row_locations):
 
         sheet_name, row_idx = existing_row_locations[key]
         ws=wb[sheet_name]
-        status_cell=ws.cell(row=row_idx, column=8)
-        summary_cell=ws.cell(row=row_idx, column=9)
-        has_status=bool(str(status_cell.value or "").strip())
+        status_col=get_column_index(ws, "ESTADO FINAL", fallback=8)
+        summary_col=get_column_index(ws, "resumen ia", fallback=9)
+        if summary_col is None:
+            continue
+        status_cell=ws.cell(row=row_idx, column=status_col) if status_col is not None else None
+        summary_cell=ws.cell(row=row_idx, column=summary_col)
+        has_status=bool(str(status_cell.value or "").strip()) if status_cell is not None else False
         has_summary=bool(str(summary_cell.value or "").strip())
 
-        if has_status and has_summary:
+        main_text=m.get("text","")
+        auto_status=infer_auto_status(main_text)
+        needs_status_update=(not has_status) and bool(auto_status)
+        needs_summary_update=(not has_summary)
+
+        if needs_status_update and status_cell is not None:
+            status_cell.value=auto_status
+            has_status=True
+            status_updated+=1
+
+        if not needs_summary_update:
             continue
 
         comments_for_ai=""
@@ -685,52 +750,70 @@ def backfill_ai_for_existing_rows(wb, msgs, existing_row_locations):
             replies=fetch_thread_replies(slack_client, thread_ts)
             comments_for_ai=build_comments_from_thread(replies, ts)
 
-        new_summary=normalize_ai_summary(generate_ai_summary(groq_client, m.get("text",""), comments_for_ai))
+        new_summary=normalize_ai_summary(generate_ai_summary(groq_client, main_text, comments_for_ai))
         checked+=1
         if new_summary and new_summary != str(summary_cell.value or "").strip():
             summary_cell.value=new_summary
-            updated+=1
+            summary_updated+=1
 
-    if checked:
-        print(f"[INFO] Backfill IA sobre filas existentes: revisadas={checked}, actualizadas={updated}")
-    return checked, updated
+    if checked or status_updated:
+        print(
+            "[INFO] Backfill IA/estado sobre filas existentes: "
+            f"revisadas={checked}, resumen_actualizado={summary_updated}, estado_actualizado={status_updated}"
+        )
+    return checked, summary_updated, status_updated
 
 def normalize_header_row(ws):
     return [str(ws.cell(row=1, column=idx).value).strip() if ws.cell(row=1, column=idx).value is not None else "" for idx in range(1, ws.max_column + 1)]
 
+def get_column_index(ws, column_name, fallback=None):
+    headers=normalize_header_row(ws)
+    for idx, name in enumerate(headers, start=1):
+        if name == column_name:
+            return idx
+    return fallback
+
+def ensure_column_exists(ws, column_name):
+    idx=get_column_index(ws, column_name)
+    if idx is not None:
+        return idx, False
+    new_idx=ws.max_column + 1
+    ws.cell(row=1, column=new_idx, value=column_name)
+    return new_idx, True
+
+def build_row_values_for_sheet(ws, row_dict):
+    headers=normalize_header_row(ws)
+    return [row_dict.get(h, "") for h in headers]
+
 def migrate_sheet_headers(ws):
-    current_headers=normalize_header_row(ws)
-    if current_headers==expected_columns:
-        return False
+    # Migración no destructiva: nunca borra filas/celdas existentes.
+    added_any=False
+    legacy_idx=get_column_index(ws, legacy_diagnosis_column)
+    comentarios_idx, comentarios_added = ensure_column_exists(ws, "Comentarios")
+    if comentarios_added:
+        added_any=True
+        if legacy_idx is not None and ws.max_row > 1:
+            for row_idx in range(2, ws.max_row + 1):
+                legacy_val=ws.cell(row=row_idx, column=legacy_idx).value
+                current_val=ws.cell(row=row_idx, column=comentarios_idx).value
+                if (current_val is None or str(current_val).strip()=="") and legacy_val not in (None, ""):
+                    ws.cell(row=row_idx, column=comentarios_idx, value=legacy_val)
 
-    header_index={name: idx for idx, name in enumerate(current_headers) if name}
-    existing_rows=list(ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True)) if ws.max_row>1 else []
-    remapped=[]
-    for old_row in existing_rows:
-        new_row=[]
-        for col_name in expected_columns:
-            value=""
-            idx=header_index.get(col_name)
-            if idx is not None and idx < len(old_row):
-                value=old_row[idx]
-            elif col_name=="Comentarios":
-                legacy_idx=header_index.get(legacy_diagnosis_column)
-                if legacy_idx is not None and legacy_idx < len(old_row):
-                    value=old_row[legacy_idx]
-            new_row.append("" if value is None else value)
-        remapped.append(new_row)
+    for col_name in expected_columns:
+        _, added = ensure_column_exists(ws, col_name)
+        if added:
+            added_any=True
 
-    ws.delete_rows(1, ws.max_row)
-    ws.append(expected_columns)
-    for row in remapped:
-        ws.append(row)
-    return True
+    return added_any
 
 def repair_invalid_hyperlinks_in_sheet(ws):
     repaired=0
     if ws.max_row<=1:
         return repaired
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=3, max_col=3):
+    slack_col=get_column_index(ws, "SLACK", fallback=3)
+    if slack_col is None:
+        return repaired
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=slack_col, max_col=slack_col):
         cell=row[0]
         val=cell.value
         if not isinstance(val,str) or not val.startswith("=HYPERLINK("):
@@ -747,8 +830,11 @@ def repair_ai_columns_in_sheet(ws):
     cleaned=0
     if ws.max_row<=1:
         return cleaned
+    summary_col=get_column_index(ws, "resumen ia", fallback=9)
+    if summary_col is None:
+        return cleaned
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        summary_cell=row[8] if len(row)>=9 else None
+        summary_cell=row[summary_col-1] if len(row)>=summary_col else None
         if summary_cell is not None and isinstance(summary_cell.value, str) and summary_cell.value.strip():
             normalized=normalize_ai_summary(summary_cell.value)
             if normalized and normalized != summary_cell.value:
@@ -800,10 +886,11 @@ def append_rows(wb,df):
     
     # Obtener claves existentes para verificar duplicados (preferimos URL del mensaje de Slack)
     existing_keys = set()
+    slack_col=get_column_index(ws, "SLACK", fallback=3)
     if ws.max_row > 1:  # Si hay datos además del header
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
-            if len(row) >= 3 and row[2]:  # SLACK column (índice 2)
-                slack_content = str(row[2]).strip()
+            if slack_col is not None and len(row) >= slack_col and row[slack_col-1]:
+                slack_content = str(row[slack_col-1]).strip()
                 url = extract_hyperlink_url(slack_content)
                 existing_keys.add(url or slack_content)
     
@@ -814,7 +901,7 @@ def append_rows(wb,df):
         if slack_content:
             key = extract_hyperlink_url(slack_content) or slack_content
             if key and key not in existing_keys:
-                ws.append([r.get(col, "") for col in expected_columns])
+                ws.append(build_row_values_for_sheet(ws, r.to_dict()))
                 existing_keys.add(key)
                 new_rows_added += 1
     
@@ -862,9 +949,15 @@ def main():
     msgs = fetch_messages(oldest=oldest, latest=latest)
 
     print(f"[INFO] Mensajes obtenidos: {len(msgs)}")
-    _, backfilled_ai = backfill_ai_for_existing_rows(wb, msgs, existing_row_locations)
+    _, backfilled_ai, backfilled_status = backfill_ai_for_existing_rows(wb, msgs, existing_row_locations)
     df=build_df(msgs, existing_keys=existing_slack_keys)
-    workbook_changed = (migrated_sheets > 0 or repaired_links > 0 or ai_cleaned > 0 or backfilled_ai > 0)
+    workbook_changed = (
+        migrated_sheets > 0
+        or repaired_links > 0
+        or ai_cleaned > 0
+        or backfilled_ai > 0
+        or backfilled_status > 0
+    )
     if not df.empty:
         print(f"[INFO] Filas a agregar: {len(df)}")
         print("[DEBUG] Preview:\n", df.head(5).to_string())
