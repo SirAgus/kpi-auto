@@ -1,27 +1,74 @@
 import os, io, requests, pandas as pd
 from datetime import timedelta
 from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 from openpyxl import load_workbook
 from openpyxl.workbook import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 import msal
 import re
 import time
+
+try:
+    from groq import Groq
+except ImportError:
+    Groq = None
 
 slack_bot_token=os.environ["SLACK_BOT_TOKEN"]
 channel_id=os.environ["SLACK_CHANNEL_ID"]
 client_id=os.environ["AZURE_CLIENT_ID"]
 refresh_token=os.environ.get("GRAPH_REFRESH_TOKEN","")
 onedrive_upn=os.environ["ONEDRIVE_UPN"]
-onedrive_file_path=os.environ.get("ONEDRIVE_FILE_PATH","/Documents/BlackBox.xlsx")
+requested_onedrive_file_path=(os.environ.get("ONEDRIVE_FILE_PATH","/Documents/BlackBox.xlsx").strip() or "/Documents/BlackBox.xlsx")
+debug_mode=os.environ.get("DEBUG_MODE","0")=="1"
+run_mode=(os.environ.get("RUN_MODE","").strip().lower() or ("dev" if debug_mode else "prod"))
+
+def build_dev_onedrive_path(path):
+    p=(path or "").strip() or "/Documents/BlackBox.xlsx"
+    if p.lower().endswith("_dev.xlsx"):
+        return p
+    if p.lower().endswith(".xlsx"):
+        return p[:-5] + "_dev.xlsx"
+    return p + "_dev.xlsx"
+
+onedrive_file_path=build_dev_onedrive_path(requested_onedrive_file_path) if run_mode=="dev" else requested_onedrive_file_path
 # target_hour_local eliminado - ya no se usa restricción de hora
 dev_team_member_ids=[i.strip() for i in os.environ.get("DEV_TEAM_MEMBER_IDS","").split(",") if i.strip()]
-debug_mode=os.environ.get("DEBUG_MODE","0")=="1"
 refresh_token_path=os.environ.get("REFRESH_TOKEN_PATH","/data/graph_refresh_token")
 device_flow_wait_seconds=int(os.environ.get("DEVICE_FLOW_WAIT_SECONDS","600"))  # 10 min
 graph_scope=os.environ.get("GRAPH_SCOPE","offline_access Files.ReadWrite").strip() or "offline_access Files.ReadWrite"
+groq_api_key=os.environ.get("GROQ_API_KEY","").strip()
+groq_model=os.environ.get("GROQ_MODEL","qwen/qwen3-32b").strip() or "qwen/qwen3-32b"
+
+expected_columns=[
+    "Fecha aproximada",
+    "Origen",
+    "SLACK",
+    "Funcionalidad Backend/Frontend",
+    "Comentarios",
+    "Categoría Soporte (estandarizado para reportes)",
+    "Propuesta (Tarea en ClickUp cuando sea desarrollable /Cambio sistema)",
+    "ESTADO FINAL",
+    "resumen ia"
+]
+legacy_diagnosis_column="Diagnóstico causa raíz"
+hyperlink_formula_pattern=re.compile(r'^=HYPERLINK\("([^"]*)","((?:[^"]|"")*)"\)$')
+user_display_names={
+    "U06BJ8JQ7B8":"agustin",
+    "U07UBRSER6D":"neil",
+    "U05D1H8JPEJ":"vico",
+    "U06BF8NPZ5J":"luna"
+}
+
+def replace_known_user_ids(text):
+    out=str(text or "")
+    for user_id, display_name in user_display_names.items():
+        out=out.replace(f"<@{user_id}>", display_name)
+        out=re.sub(rf"\b{re.escape(user_id)}\b", display_name, out)
+    return out
 
 def now_scl():
     return datetime.now(tz=ZoneInfo("America/Santiago"))
@@ -286,43 +333,197 @@ def fetch_messages(oldest=None, latest=None):
 def tz_dt(ts):
     return datetime.fromtimestamp(float(ts),tz=timezone.utc).astimezone(ZoneInfo("America/Santiago"))
 
-def build_df(msgs):
+def sanitize_text(text, max_len=None, escape_quotes=False):
+    if text is None:
+        return ""
+    out=replace_known_user_ids(text).replace("\n"," ").replace("\r"," ")
+    out=re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]"," ",out)
+    out=re.sub(r"\s+"," ",out).strip()
+    if max_len and len(out)>max_len:
+        out=out[:max_len-3]+"..."
+    if escape_quotes:
+        out=out.replace('"','""')
+    return out
+
+def build_hyperlink_formula(url, label):
+    safe_label=sanitize_text(label, max_len=200, escape_quotes=True)
+    if not safe_label:
+        safe_label="Abrir mensaje"
+    formula=f'=HYPERLINK("{url}","{safe_label}")'
+    if not hyperlink_formula_pattern.match(formula):
+        formula=f'=HYPERLINK("{url}","Abrir mensaje")'
+    return formula
+
+def build_slack_hyperlink(ts, text):
+    ts_formatted=str(ts or "").replace(".","")
+    slack_link=f"https://mq-sede.slack.com/archives/{channel_id}/p{ts_formatted}"
+    return build_hyperlink_formula(slack_link, text), slack_link
+
+def fetch_thread_replies(client, thread_ts):
+    if not thread_ts:
+        return []
+    out=[]
+    cur=None
+    while True:
+        try:
+            res=client.conversations_replies(
+                channel=channel_id,
+                ts=thread_ts,
+                limit=200,
+                cursor=cur
+            )
+        except SlackApiError as e:
+            err=e.response.get("error") if getattr(e, "response", None) else str(e)
+            print(f"[WARN] No se pudo leer hilo {thread_ts}: {err}")
+            break
+        out.extend(res.get("messages",[]))
+        cur=res.get("response_metadata",{}).get("next_cursor")
+        if not cur:
+            break
+    return out
+
+def build_comments_from_thread(replies, root_ts):
+    comentarios=[]
+    for msg in replies:
+        if msg.get("ts")==root_ts:
+            continue
+        txt=sanitize_text(msg.get("text",""), max_len=600)
+        if not txt:
+            continue
+        user_id=msg.get("user")
+        author=user_display_names.get(user_id, user_id) if user_id else (msg.get("bot_id") or "desconocido")
+        ts=msg.get("ts")
+        if ts:
+            fecha=tz_dt(ts).strftime("%Y-%m-%d %H:%M:%S")
+            comentarios.append(f"[{fecha}] {author}: {txt}")
+        else:
+            comentarios.append(f"{author}: {txt}")
+    merged=" | ".join(comentarios).strip()
+    return merged[:3997]+"..." if len(merged)>4000 else merged
+
+def create_groq_client():
+    if not groq_api_key:
+        print("[WARN] GROQ_API_KEY no configurada; 'resumen ia' se completará con fallback.")
+        return None
+    if Groq is None:
+        print("[WARN] Librería groq no instalada; 'resumen ia' se completará con fallback.")
+        return None
+    try:
+        return Groq(api_key=groq_api_key)
+    except Exception as e:
+        print(f"[WARN] No se pudo crear cliente Groq: {e}")
+        return None
+
+def generate_ai_summary(groq_client, main_text, comments_text):
+    if not comments_text:
+        return "Sin comentarios en el hilo. Conclusión: Sin información suficiente."
+    if groq_client is None:
+        return "No se pudo generar resumen IA (sin cliente Groq). Conclusión: Sin información suficiente."
+
+    prompt=(
+        "Analiza este hilo de soporte de Slack y entrega un resumen breve.\n"
+        "Mensaje principal:\n"
+        f"{sanitize_text(main_text, max_len=2000)}\n\n"
+        "Comentarios del hilo:\n"
+        f"{sanitize_text(comments_text, max_len=6000)}\n\n"
+        "Responde en español con máximo 3 frases. "
+        "No incluyas razonamiento interno, ni etiquetas XML/HTML como <think>. "
+        "La última frase debe empezar exactamente con 'Conclusión:' y usar solo una etiqueta: "
+        "'Resuelto', 'No resuelto' o 'Sin información suficiente'."
+    )
+
+    try:
+        completion=groq_client.chat.completions.create(
+            model=groq_model,
+            messages=[
+                {
+                    "role":"user",
+                    "content":prompt
+                }
+            ],
+            temperature=0.6,
+            max_completion_tokens=4096,
+            top_p=0.95,
+            reasoning_effort="default",
+            stream=True,
+            stop=None
+        )
+        output=[]
+        for chunk in completion:
+            output.append(chunk.choices[0].delta.content or "")
+        summary=normalize_ai_summary("".join(output))
+        if summary:
+            return summary[:4997]+"..." if len(summary)>5000 else summary
+    except Exception as e:
+        print(f"[WARN] Error generando resumen IA: {e}")
+
+    return "No se pudo generar resumen IA. Conclusión: Sin información suficiente."
+
+def normalize_ai_summary(text):
+    s=(text or "").strip()
+    s=re.sub(r"<think>.*?</think>\s*","",s,flags=re.IGNORECASE|re.DOTALL)
+    s=s.replace("**","").replace("__","")
+    s=sanitize_text(s)
+    return s
+
+def infer_final_status(summary):
+    s=normalize_ai_summary(summary).lower()
+    s=re.sub(r"[^a-záéíóúüñ ]+"," ",s)
+    s=re.sub(r"\s+"," ",s).strip()
+    if "conclusión resuelto" in s or "conclusion resuelto" in s:
+        return "Resuelto"
+    if "conclusión no resuelto" in s or "conclusion no resuelto" in s:
+        return "No resuelto"
+    if "conclusión sin información suficiente" in s or "conclusion sin información suficiente" in s:
+        return "Sin información suficiente"
+    return ""
+
+def build_df(msgs, existing_keys=None):
     datos=[]
+    known_keys=set(existing_keys or [])
+    slack_client=WebClient(token=slack_bot_token)
+    groq_client=create_groq_client()
+
     for m in reversed(msgs):
         uid=m.get("user")
         if not uid:
             continue
-        dt=tz_dt(m.get("ts"))
+
+        ts=m.get("ts")
+        if not ts:
+            continue
+
+        slack_content, slack_link=build_slack_hyperlink(ts, m.get("text",""))
+        key=slack_link or slack_content
+        if key in known_keys:
+            continue
+
+        dt=tz_dt(ts)
         origen="Producto" if uid in dev_team_member_ids else "Otras áreas"
-        
-        # Crear enlace clickeable al mensaje de Slack
-        ts = m.get("ts", "")
-        # Formatear timestamp correctamente para Slack (formato: p1234567890123456)
-        ts_formatted = ts.replace('.', '')
-        slack_link = f"https://mq-sede.slack.com/archives/{channel_id}/p{ts_formatted}"
-        slack_text = m.get("text", "")
-        
-        # Limpiar texto para evitar caracteres problemáticos en Excel
-        if slack_text:
-            # Escapar comillas y caracteres especiales
-            clean_text = slack_text.replace('"', '""').replace('\n', ' ').replace('\r', ' ')
-            # Limitar longitud del texto para evitar problemas
-            if len(clean_text) > 200:
-                clean_text = clean_text[:197] + "..."
-            slack_content = f'=HYPERLINK("{slack_link}","{clean_text}")'
-        else:
-            slack_content = ""
-        
+
+        comments_for_ai=""
+        reply_count=int(m.get("reply_count",0) or 0)
+        if reply_count>0:
+            thread_ts=m.get("thread_ts") or ts
+            replies=fetch_thread_replies(slack_client, thread_ts)
+            comments_for_ai=build_comments_from_thread(replies, ts)
+
+        resumen_ia=generate_ai_summary(groq_client, m.get("text",""), comments_for_ai)
+
         datos.append({
             "Fecha aproximada":dt.strftime("%Y-%m-%d %H:%M:%S"),
             "Origen":origen,
             "SLACK":slack_content,
-            "Diagnóstico causa raíz":"",
+            "Funcionalidad Backend/Frontend":"",
+            "Comentarios":"",
+            "Categoría Soporte (estandarizado para reportes)":"",
             "Propuesta (Tarea en ClickUp cuando sea desarrollable /Cambio sistema)":"",
-            "ESTADO FINAL":""
+            "ESTADO FINAL":"",
+            "resumen ia":resumen_ia
         })
-    cols=["Fecha aproximada","Origen","SLACK","Diagnóstico causa raíz","Propuesta (Tarea en ClickUp cuando sea desarrollable /Cambio sistema)","ESTADO FINAL"]
-    return pd.DataFrame(datos,columns=cols) if datos else pd.DataFrame(columns=cols)
+        known_keys.add(key)
+
+    return pd.DataFrame(datos,columns=expected_columns) if datos else pd.DataFrame(columns=expected_columns)
 
 def extract_hyperlink_url(cell_value):
     """
@@ -372,7 +573,7 @@ def apply_table_style(ws, num_rows):
         )
         
         # Aplicar estilo al header (fila 1)
-        for col in range(1, min(ws.max_column + 1, 7)):  # Limitar a 6 columnas
+        for col in range(1, ws.max_column + 1):
             cell = ws.cell(row=1, column=col)
             cell.font = header_font
             cell.fill = header_fill
@@ -381,29 +582,33 @@ def apply_table_style(ws, num_rows):
         
         # Aplicar estilo a las filas de datos
         for row in range(2, min(num_rows + 1, ws.max_row + 1)):
-            for col in range(1, min(ws.max_column + 1, 7)):  # Limitar a 6 columnas
+            for col in range(1, ws.max_column + 1):
                 cell = ws.cell(row=row, column=col)
                 cell.font = data_font
                 cell.alignment = data_alignment
                 cell.border = thin_border
         
-        # Ajustar ancho de columnas (valores más grandes para evitar tablas pequeñas)
+        # Ajustar ancho de columnas
         column_widths = {
-            'A': 25,  # Fecha aproximada
-            'B': 18,  # Origen
-            'C': 60,  # SLACK
-            'D': 35,  # Diagnóstico causa raíz
-            'E': 45,  # Propuesta
-            'F': 25   # ESTADO FINAL
+            1: 23,  # Fecha aproximada
+            2: 18,  # Origen
+            3: 60,  # SLACK
+            4: 30,  # Funcionalidad Backend/Frontend
+            5: 65,  # Comentarios
+            6: 42,  # Categoría Soporte
+            7: 48,  # Propuesta
+            8: 22,  # ESTADO FINAL
+            9: 70   # resumen ia
         }
         
-        for col_letter, width in column_widths.items():
+        for col_index, width in column_widths.items():
+            col_letter = get_column_letter(col_index)
             ws.column_dimensions[col_letter].width = width
         
-        # Ajustar altura de filas (altura más grande para mejor legibilidad)
-        max_rows = min(num_rows, 200)  # Aumentar límite
+        # Ajustar altura de filas
+        max_rows = min(num_rows, 200)
         for row in range(1, max_rows + 1):
-            ws.row_dimensions[row].height = 40  # Aumentar altura de filas
+            ws.row_dimensions[row].height = 42
         
         # Asegurar que el zoom esté al 100%
         ws.sheet_view.zoomScale = 100
@@ -414,6 +619,103 @@ def apply_table_style(ws, num_rows):
         print(f"[WARN] Error aplicando estilo: {e}")
         # Continuar sin estilo si hay problemas
 
+def collect_existing_slack_keys(wb):
+    keys=set()
+    for sheet_name in wb.sheetnames:
+        ws=wb[sheet_name]
+        if ws.max_row<=1:
+            continue
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
+            if len(row)>=3 and row[2]:
+                slack_content=str(row[2]).strip()
+                url=extract_hyperlink_url(slack_content)
+                keys.add(url or slack_content)
+    return keys
+
+def normalize_header_row(ws):
+    return [str(ws.cell(row=1, column=idx).value).strip() if ws.cell(row=1, column=idx).value is not None else "" for idx in range(1, ws.max_column + 1)]
+
+def migrate_sheet_headers(ws):
+    current_headers=normalize_header_row(ws)
+    if current_headers==expected_columns:
+        return False
+
+    header_index={name: idx for idx, name in enumerate(current_headers) if name}
+    existing_rows=list(ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True)) if ws.max_row>1 else []
+    remapped=[]
+    for old_row in existing_rows:
+        new_row=[]
+        for col_name in expected_columns:
+            value=""
+            idx=header_index.get(col_name)
+            if idx is not None and idx < len(old_row):
+                value=old_row[idx]
+            elif col_name=="Comentarios":
+                legacy_idx=header_index.get(legacy_diagnosis_column)
+                if legacy_idx is not None and legacy_idx < len(old_row):
+                    value=old_row[legacy_idx]
+            new_row.append("" if value is None else value)
+        remapped.append(new_row)
+
+    ws.delete_rows(1, ws.max_row)
+    ws.append(expected_columns)
+    for row in remapped:
+        ws.append(row)
+    return True
+
+def repair_invalid_hyperlinks_in_sheet(ws):
+    repaired=0
+    if ws.max_row<=1:
+        return repaired
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=3, max_col=3):
+        cell=row[0]
+        val=cell.value
+        if not isinstance(val,str) or not val.startswith("=HYPERLINK("):
+            continue
+        if hyperlink_formula_pattern.match(val):
+            continue
+        url=extract_hyperlink_url(val)
+        if url:
+            cell.value=build_hyperlink_formula(url, "Abrir mensaje")
+            repaired+=1
+    return repaired
+
+def repair_ai_columns_in_sheet(ws):
+    cleaned=0
+    if ws.max_row<=1:
+        return cleaned
+    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+        summary_cell=row[8] if len(row)>=9 else None
+        if summary_cell is not None and isinstance(summary_cell.value, str) and summary_cell.value.strip():
+            normalized=normalize_ai_summary(summary_cell.value)
+            if normalized and normalized != summary_cell.value:
+                summary_cell.value=normalized
+                cleaned+=1
+    return cleaned
+
+def migrate_and_repair_workbook(wb):
+    migrated=0
+    repaired=0
+    ai_cleaned=0
+    for sheet_name in wb.sheetnames:
+        ws=wb[sheet_name]
+        # No tocar hojas vacías temporales
+        if ws.max_row==1 and ws.max_column==1 and ws["A1"].value is None:
+            continue
+        if migrate_sheet_headers(ws):
+            migrated+=1
+        repaired+=repair_invalid_hyperlinks_in_sheet(ws)
+        ai_cleaned += repair_ai_columns_in_sheet(ws)
+        if ws.max_row>1:
+            apply_table_style(ws, ws.max_row)
+    if migrated or repaired or ai_cleaned:
+        print(
+            "[INFO] Migración/Reparación aplicada - "
+            f"hojas migradas: {migrated}, hipervínculos reparados: {repaired}, "
+            f"resúmenes IA limpiados: {ai_cleaned}"
+        )
+    return migrated, repaired, ai_cleaned
+
 def append_rows(wb,df):
     if df.empty:
         return
@@ -423,18 +725,15 @@ def append_rows(wb,df):
     # Verificar si la hoja ya existe
     if hoja not in wb.sheetnames:
         ws=wb.create_sheet(title=hoja)
-        ws.append(list(df.columns))
+        ws.append(expected_columns)
         # Aplicar estilo inmediatamente al crear nueva hoja
         apply_table_style(ws, 1)
         print(f"[INFO] Nueva hoja '{hoja}' creada con estilo")
     else:
         ws=wb[hoja]
-        if ws.max_row==1 and [c.value for c in ws[1]]!=list(df.columns):
-            ws.delete_rows(1,ws.max_row)
-            ws.append(list(df.columns))
-            # Aplicar estilo cuando se recrea el header
+        if migrate_sheet_headers(ws):
             apply_table_style(ws, 1)
-            print(f"[INFO] Header de hoja '{hoja}' recreado con estilo")
+            print(f"[INFO] Hoja '{hoja}' migrada al nuevo esquema de columnas")
     
     # Obtener claves existentes para verificar duplicados (preferimos URL del mensaje de Slack)
     existing_keys = set()
@@ -452,7 +751,7 @@ def append_rows(wb,df):
         if slack_content:
             key = extract_hyperlink_url(slack_content) or slack_content
             if key and key not in existing_keys:
-                ws.append(list(r.values))
+                ws.append([r.get(col, "") for col in expected_columns])
                 existing_keys.add(key)
                 new_rows_added += 1
     
@@ -468,10 +767,24 @@ def append_rows(wb,df):
 
 def main():
     print(f"[INFO] Inicio ejecución: {now_scl()}")
+    print(f"[INFO] Modo ejecución: {run_mode} | OneDrive destino: {onedrive_file_path}")
     token=acquire_token()
     print("[INFO] Access token obtenido")
 
     ensure_file(token)
+
+    bio=dl_excel(token)
+    try:
+        wb=load_workbook(bio)
+        print("[INFO] Excel cargado")
+    except Exception:
+        wb=Workbook()
+        wb.active.title="TMP"
+        print("[WARN] Excel nuevo creado")
+
+    migrated_sheets, repaired_links, ai_cleaned = migrate_and_repair_workbook(wb)
+    existing_slack_keys=collect_existing_slack_keys(wb)
+    print(f"[INFO] Claves Slack ya existentes en Excel: {len(existing_slack_keys)}")
 
     # Ejecutar siempre, sin restricción de hora
     print(f"[INFO] Ejecutando sin restricción de hora (debug_mode: {debug_mode})")
@@ -485,26 +798,19 @@ def main():
     msgs = fetch_messages(oldest=oldest, latest=latest)
 
     print(f"[INFO] Mensajes obtenidos: {len(msgs)}")
-    df=build_df(msgs)
-    if df.empty:
-        print("[INFO] No hay mensajes nuevos")
-        return
-    print(f"[INFO] Filas a agregar: {len(df)}")
-    print("[DEBUG] Preview:\n", df.head(5).to_string())
-
-    bio=dl_excel(token)
-    try:
-        wb=load_workbook(bio)
-        print("[INFO] Excel cargado")
-    except:
-        wb=Workbook()
-        wb.active.title="TMP"
-        print("[WARN] Excel nuevo creado")
-
-    append_rows(wb,df)
+    df=build_df(msgs, existing_keys=existing_slack_keys)
+    workbook_changed = (migrated_sheets > 0 or repaired_links > 0 or ai_cleaned > 0)
     if not df.empty:
+        print(f"[INFO] Filas a agregar: {len(df)}")
+        print("[DEBUG] Preview:\n", df.head(5).to_string())
+        append_rows(wb,df)
         sheet_name = get_month_name_from_period(df)
         print(f"[INFO] Datos procesados en hoja '{sheet_name}'")
+        workbook_changed = True
+    else:
+        print("[INFO] No hay mensajes nuevos")
+        if not workbook_changed:
+            return
 
     out=io.BytesIO()
     wb.save(out)
