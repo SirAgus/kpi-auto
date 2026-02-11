@@ -466,6 +466,71 @@ def normalize_ai_summary(text):
     s=sanitize_text(s)
     return s
 
+def normalize_ai_status_output(text):
+    s=(text or "").strip()
+    if not s:
+        return ""
+    s=s.replace("**","").replace("__","")
+    normalized=normalize_for_status_matching(s)
+    if not normalized:
+        return ""
+    if "idea" in normalized:
+        return "IDEA"
+    if "anuncio" in normalized or "agradecimiento" in normalized:
+        return "Anuncio/Agradecimiento"
+    empty_signals=("vacio", "sin estado", "sin categoria", "ninguno", "ninguna", "no aplica")
+    if any(sig in normalized for sig in empty_signals):
+        return ""
+    return ""
+
+def generate_ai_status(groq_client, main_text, comments_text):
+    fallback_status=infer_auto_status(main_text)
+    if groq_client is None:
+        return fallback_status
+
+    prompt=(
+        "Clasifica el mensaje de Slack para la columna 'ESTADO FINAL'.\n"
+        "Responde SOLO con una etiqueta exacta (sin explicación):\n"
+        "IDEA\n"
+        "Anuncio/Agradecimiento\n"
+        "VACIO\n\n"
+        "Reglas:\n"
+        "- IDEA: solicitud o sugerencia de nueva funcionalidad/cambio.\n"
+        "- Anuncio/Agradecimiento: comunicación de novedades/despliegues o agradecimientos.\n"
+        "- VACIO: cuando no aplica ninguna etiqueta.\n\n"
+        "Mensaje principal:\n"
+        f"{sanitize_text(main_text, max_len=2500)}\n\n"
+        "Comentarios del hilo (puede estar vacío):\n"
+        f"{sanitize_text(comments_text, max_len=3500)}\n"
+    )
+
+    try:
+        completion=groq_client.chat.completions.create(
+            model=groq_model,
+            messages=[
+                {
+                    "role":"user",
+                    "content":prompt
+                }
+            ],
+            temperature=0,
+            max_completion_tokens=64,
+            top_p=1,
+            reasoning_effort="default",
+            stream=True,
+            stop=None
+        )
+        output=[]
+        for chunk in completion:
+            output.append(chunk.choices[0].delta.content or "")
+        ai_status=normalize_ai_status_output("".join(output))
+        if ai_status in {"IDEA", "Anuncio/Agradecimiento", ""}:
+            return ai_status
+    except Exception as e:
+        print(f"[WARN] Error generando estado IA: {e}")
+
+    return fallback_status
+
 def normalize_for_status_matching(text):
     s=sanitize_text(text).lower()
     replacements=str.maketrans("áéíóúüñ","aeiouun")
@@ -503,8 +568,26 @@ def is_announcement_or_gratitude(text):
     if any(sig in s for sig in announcement_signals):
         return True
 
-    gratitude_signals=("gracias", "muchas gracias", "agradecido", "agradecida", "agradecimiento")
+    # Detecta anuncios del tipo "nuevo/nueva + funcionalidad" aunque no mencionen "producción".
+    announcement_change_signals=(
+        "nuevo", "nueva", "nuevos", "nuevas",
+        "se agrego", "agregamos",
+        "se habilito", "habilitamos",
+        "se actualizo", "actualizamos",
+        "mejora", "mejoras",
+    )
+    announcement_feature_signals=(
+        "filtro", "funcionalidad", "opcion", "campo", "modulo", "reporte",
+        "pantalla", "proceso", "flujo", "regla", "validacion", "credito", "creditos",
+    )
     issue_signals=("error", "problema", "no funciona", "no me", "ayuda", "incidencia")
+    has_announcement_tone=any(sig in s for sig in announcement_change_signals)
+    has_feature_context=any(sig in s for sig in announcement_feature_signals)
+    has_issue_tone=any(sig in s for sig in issue_signals)
+    if has_announcement_tone and has_feature_context and not has_issue_tone:
+        return True
+
+    gratitude_signals=("gracias", "muchas gracias", "agradecido", "agradecida", "agradecimiento")
     return (
         any(sig in s for sig in gratitude_signals)
         and len(s.split()) <= 14
@@ -550,7 +633,7 @@ def build_df(msgs, existing_keys=None):
 
         main_text=m.get("text","")
         resumen_ia=generate_ai_summary(groq_client, main_text, comments_for_ai)
-        auto_status=infer_auto_status(main_text)
+        auto_status=generate_ai_status(groq_client, main_text, comments_for_ai)
 
         datos.append({
             "Fecha aproximada":dt.strftime("%Y-%m-%d %H:%M:%S"),
