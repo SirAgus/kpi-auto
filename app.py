@@ -594,9 +594,6 @@ def get_month_name_from_period(df):
 
 def apply_table_style(ws, num_rows):
     """Aplica estilo profesional a la tabla"""
-    if num_rows <= 1:  # Solo header o sin datos
-        return
-    
     try:
         # Definir estilos
         header_font = Font(bold=True, color="FFFFFF", size=12)
@@ -605,6 +602,7 @@ def apply_table_style(ws, num_rows):
         
         data_font = Font(size=11)
         data_alignment = Alignment(vertical="top", wrap_text=True)
+        highlight_blue_fill = PatternFill(start_color="CFE2F3", end_color="CFE2F3", fill_type="solid")
         
         # Borde para todas las celdas
         thin_border = Border(
@@ -621,14 +619,31 @@ def apply_table_style(ws, num_rows):
             cell.fill = header_fill
             cell.alignment = header_alignment
             cell.border = thin_border
+
+        # Dejar fijo el header (fila 1)
+        ws.freeze_panes = "A2"
+
+        if num_rows <= 1:  # Solo header o sin datos
+            return
         
         # Aplicar estilo a las filas de datos
+        estado_col_idx = get_column_index(ws, "ESTADO FINAL")
         for row in range(2, min(num_rows + 1, ws.max_row + 1)):
+            highlight_blue = False
+            if estado_col_idx is not None:
+                raw_status = ws.cell(row=row, column=estado_col_idx).value
+                normalized_status = normalize_for_status_matching(raw_status)
+                highlight_blue = any(
+                    kw in normalized_status for kw in ("idea", "anuncio", "agradecimiento")
+                )
+
             for col in range(1, ws.max_column + 1):
                 cell = ws.cell(row=row, column=col)
                 cell.font = data_font
                 cell.alignment = data_alignment
                 cell.border = thin_border
+                if highlight_blue:
+                    cell.fill = highlight_blue_fill
         
         # Ajustar ancho de columnas por nombre (robusto si el orden cambia)
         column_widths_by_name = {
