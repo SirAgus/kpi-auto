@@ -513,7 +513,7 @@ def is_announcement_or_gratitude(text):
 
 def infer_auto_status(main_text):
     if is_idea_request(main_text):
-        return "Estado IDEA"
+        return "IDEA"
     if is_announcement_or_gratitude(main_text):
         return "Anuncio/Agradecimiento"
     return ""
