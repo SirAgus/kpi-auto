@@ -31,6 +31,7 @@ classification_guide_path=(os.environ.get("BLACKBOX_GUIDE_PATH","blackbox-catego
 blackbox_guide_required=(os.environ.get("BLACKBOX_GUIDE_REQUIRED","1").strip()=="1")
 classification_guide_max_chars=max(1200, int(os.environ.get("BLACKBOX_GUIDE_MAX_CHARS","6000")))
 strict_md_classification=(os.environ.get("STRICT_MD_CLASSIFICATION","1").strip()=="1")
+app_base_dir=os.path.dirname(os.path.abspath(__file__))
 
 def build_dev_onedrive_path(path):
     p=(path or "").strip() or "/Documents/BlackBox.xlsx"
@@ -488,15 +489,28 @@ def get_blackbox_guide_text():
         "Para Duda, Idea y Aviso, usar No aplica."
     )
     try:
-        with open(classification_guide_path, "r", encoding="utf-8") as f:
+        guide_candidates=[classification_guide_path]
+        if not os.path.isabs(classification_guide_path):
+            guide_candidates.append(os.path.join(app_base_dir, classification_guide_path))
+        resolved_path=None
+        for candidate in guide_candidates:
+            if candidate and os.path.exists(candidate):
+                resolved_path=candidate
+                break
+        if not resolved_path:
+            raise FileNotFoundError(
+                f"No existe guía en ninguna ruta candidata: {guide_candidates}"
+            )
+
+        with open(resolved_path, "r", encoding="utf-8") as f:
             raw=f.read().strip()
             if not raw:
                 if blackbox_guide_required:
-                    raise RuntimeError(f"La guía {classification_guide_path} está vacía y es obligatoria")
+                    raise RuntimeError(f"La guía {resolved_path} está vacía y es obligatoria")
                 blackbox_guide_cache=default_text
             else:
                 blackbox_guide_cache=raw
-                print(f"[INFO] Guía BlackBox cargada desde {classification_guide_path} ({len(raw)} chars)")
+                print(f"[INFO] Guía BlackBox cargada desde {resolved_path} ({len(raw)} chars)")
     except Exception as e:
         if blackbox_guide_required:
             raise RuntimeError(
