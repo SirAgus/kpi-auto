@@ -1,4 +1,4 @@
-import os, io, requests, pandas as pd
+import os, io, json, requests, pandas as pd
 from datetime import timedelta
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -19,12 +19,18 @@ except ImportError:
 
 slack_bot_token=os.environ["SLACK_BOT_TOKEN"]
 channel_id=os.environ["SLACK_CHANNEL_ID"]
-client_id=os.environ["AZURE_CLIENT_ID"]
-refresh_token=os.environ.get("GRAPH_REFRESH_TOKEN","")
-onedrive_upn=os.environ["ONEDRIVE_UPN"]
-requested_onedrive_file_path=(os.environ.get("ONEDRIVE_FILE_PATH","/Documents/BlackBox.xlsx").strip() or "/Documents/BlackBox.xlsx")
 debug_mode=os.environ.get("DEBUG_MODE","0")=="1"
 run_mode=(os.environ.get("RUN_MODE","").strip().lower() or ("dev" if debug_mode else "prod"))
+local_mode=run_mode=="local"
+local_excel_path=(os.environ.get("LOCAL_EXCEL_PATH","./BlackBox_local.xlsx").strip() or "./BlackBox_local.xlsx")
+client_id=os.environ.get("AZURE_CLIENT_ID","").strip()
+refresh_token=os.environ.get("GRAPH_REFRESH_TOKEN","")
+onedrive_upn=os.environ.get("ONEDRIVE_UPN","").strip()
+requested_onedrive_file_path=(os.environ.get("ONEDRIVE_FILE_PATH","/Documents/BlackBox.xlsx").strip() or "/Documents/BlackBox.xlsx")
+classification_guide_path=(os.environ.get("BLACKBOX_GUIDE_PATH","blackbox-categorias.md").strip() or "blackbox-categorias.md")
+blackbox_guide_required=(os.environ.get("BLACKBOX_GUIDE_REQUIRED","1").strip()=="1")
+classification_guide_max_chars=max(1200, int(os.environ.get("BLACKBOX_GUIDE_MAX_CHARS","6000")))
+strict_md_classification=(os.environ.get("STRICT_MD_CLASSIFICATION","1").strip()=="1")
 
 def build_dev_onedrive_path(path):
     p=(path or "").strip() or "/Documents/BlackBox.xlsx"
@@ -45,9 +51,10 @@ groq_model=os.environ.get("GROQ_MODEL","qwen/qwen3-32b").strip() or "qwen/qwen3-
 
 expected_columns=[
     "Fecha aproximada",
-    "Origen",
     "SLACK",
-    "Funcionalidad Backend/Frontend",
+    "Tipo de función",
+    "Módulo funcional",
+    "Causa raíz",
     "Comentarios",
     "Categoría Soporte (estandarizado para reportes)",
     "Propuesta (Tarea en ClickUp cuando sea desarrollable /Cambio sistema)",
@@ -56,18 +63,146 @@ expected_columns=[
 ]
 legacy_diagnosis_column="Diagnóstico causa raíz"
 hyperlink_formula_pattern=re.compile(r'^=HYPERLINK\("([^"]*)","((?:[^"]|"")*)"\)$')
+blackbox_guide_cache=None
+
+tipo_funcion_labels=[
+    "Incidencia",
+    "Duda",
+    "Idea",
+    "Soporte operativo",
+    "Aviso",
+]
+
+modulo_funcional_labels=[
+    "Contratos",
+    "Cobros",
+    "Pagos",
+    "Liquidaciones",
+    "Conciliación bancaria",
+    "IPC / UF / Reajuste",
+    "Propiedades / Unidades",
+    "Stakeholders / Figuras",
+    "Portal Arrendatarios",
+    "CRM / Bot WhatsApp",
+    "Corretaje",
+    "Planner",
+    "Servicios básicos",
+    "Reportes / Exports",
+    "Permisos / Auth",
+    "Infraestructura",
+]
+
+causa_raiz_labels=[
+    "Dato legacy / Dato histórico con problemas",
+    "Lógica de negocio",
+    "Caso borde no cubierto",
+    "Gap de QA",
+    "Integración externa",
+    "UX / Capacitación",
+    "Performance",
+    "Configuración / Deploy",
+    "Desconocido",
+    "No aplica",
+]
+
+causa_raiz_requerida_para={"Incidencia","Soporte operativo"}
+
+tipo_funcion_aliases={
+    "incidente":"Incidencia",
+    "incidencias":"Incidencia",
+    "pregunta":"Duda",
+    "consulta":"Duda",
+    "dudas":"Duda",
+    "idea de mejora":"Idea",
+    "sugerencia":"Idea",
+    "mejora":"Idea",
+    "soporte":"Soporte operativo",
+    "soporte manual":"Soporte operativo",
+    "operativo":"Soporte operativo",
+    "aviso informativo":"Aviso",
+    "anuncio":"Aviso",
+    "agradecimiento":"Aviso",
+}
+
+modulo_funcional_aliases={
+    "conciliacion":"Conciliación bancaria",
+    "portal":"Portal Arrendatarios",
+    "crm":"CRM / Bot WhatsApp",
+    "bot whatsapp":"CRM / Bot WhatsApp",
+    "reportes":"Reportes / Exports",
+    "exports":"Reportes / Exports",
+    "auth":"Permisos / Auth",
+    "permisos":"Permisos / Auth",
+    "ipc":"IPC / UF / Reajuste",
+    "uf":"IPC / UF / Reajuste",
+}
+
+causa_raiz_aliases={
+    "dato legacy":"Dato legacy / Dato histórico con problemas",
+    "dato historico con problemas":"Dato legacy / Dato histórico con problemas",
+    "dato historico":"Dato legacy / Dato histórico con problemas",
+    "logica negocio":"Lógica de negocio",
+    "logica de negocio":"Lógica de negocio",
+    "caso borde":"Caso borde no cubierto",
+    "qa":"Gap de QA",
+    "gap qa":"Gap de QA",
+    "integracion":"Integración externa",
+    "integracion externa":"Integración externa",
+    "ux":"UX / Capacitación",
+    "capacitacion":"UX / Capacitación",
+    "performance":"Performance",
+    "configuracion":"Configuración / Deploy",
+    "deploy":"Configuración / Deploy",
+    "desconocida":"Desconocido",
+    "n a":"No aplica",
+    "na":"No aplica",
+    "vacio":"No aplica",
+}
 user_display_names={
     "U06BJ8JQ7B8":"agustin",
     "U07UBRSER6D":"neil",
     "U05D1H8JPEJ":"vico",
     "U06BF8NPZ5J":"luna"
 }
+mention_user_pattern=re.compile(r"<@([A-Z0-9]+)>")
+
+def get_user_label(user_id):
+    uid=(user_id or "").strip()
+    if not uid:
+        return "desconocido"
+    display_name=user_display_names.get(uid)
+    return display_name if display_name else uid
 
 def replace_known_user_ids(text):
     out=str(text or "")
+    def replace_mention(match):
+        return get_user_label(match.group(1))
+    out=mention_user_pattern.sub(replace_mention, out)
+    return out
+
+def canonicalize_known_user_labels(text):
+    out=str(text or "")
     for user_id, display_name in user_display_names.items():
-        out=out.replace(f"<@{user_id}>", display_name)
-        out=re.sub(rf"\b{re.escape(user_id)}\b", display_name, out)
+        canonical=display_name
+        out=re.sub(
+            rf"\b{re.escape(display_name)}\s*\(\s*{re.escape(user_id)}\s*\)",
+            canonical,
+            out,
+            flags=re.IGNORECASE
+        )
+        out=re.sub(
+            rf"\b{re.escape(user_id)}\s*\(\s*{re.escape(display_name)}\s*\)",
+            canonical,
+            out,
+            flags=re.IGNORECASE
+        )
+        out=re.sub(
+            rf"\b{re.escape(user_id)}\s*==\s*{re.escape(display_name)}\b",
+            canonical,
+            out,
+            flags=re.IGNORECASE
+        )
+        out=re.sub(rf"\b{re.escape(user_id)}\b", canonical, out)
     return out
 
 def now_scl():
@@ -264,6 +399,33 @@ def ensure_file(token):
     elif r.status_code>=400:
         raise RuntimeError("meta")
 
+def ensure_local_file(path):
+    p=(path or "").strip() or "./BlackBox_local.xlsx"
+    if os.path.exists(p):
+        return
+    parent=os.path.dirname(p)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    wb=Workbook()
+    ws=wb.active
+    ws.title="TMP"
+    wb.save(p)
+    print(f"[INFO] Archivo local creado: {os.path.abspath(p)}")
+
+def dl_excel_local(path):
+    with open(path, "rb") as f:
+        return io.BytesIO(f.read())
+
+def up_excel_local(path, bio):
+    p=(path or "").strip() or "./BlackBox_local.xlsx"
+    parent=os.path.dirname(p)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(p, "wb") as f:
+        f.write(bio.getvalue())
+    print(f"[INFO] Excel guardado en local: {os.path.abspath(p)}")
+    return True
+
 def dl_excel(token):
     url=f"https://graph.microsoft.com/v1.0/users/{onedrive_upn}/drive/root:{onedrive_file_path}:/content"
     return io.BytesIO(gget(url,token).content)
@@ -311,6 +473,52 @@ def up_excel(token,bio):
         # No lanzar excepción, solo reportar el error
         print(f"[WARN] Continuando sin subir a OneDrive debido al error")
         return False
+
+def get_blackbox_guide_text():
+    global blackbox_guide_cache
+    if blackbox_guide_cache is not None:
+        return blackbox_guide_cache
+    default_text=(
+        "Dimensión 1 (Tipo de entrada): Incidencia, Duda, Idea, Soporte operativo, Aviso.\n"
+        "Dimensión 2 (Módulo funcional): Contratos, Cobros, Pagos, Liquidaciones, Conciliación bancaria, "
+        "IPC / UF / Reajuste, Propiedades / Unidades, Stakeholders / Figuras, Portal Arrendatarios, "
+        "CRM / Bot WhatsApp, Corretaje, Planner, Servicios básicos, Reportes / Exports, Permisos / Auth, Infraestructura.\n"
+        "Dimensión 3 (Causa raíz): Dato legacy / Dato histórico con problemas, Lógica de negocio, Caso borde no cubierto, "
+        "Gap de QA, Integración externa, UX / Capacitación, Performance, Configuración / Deploy, Desconocido. "
+        "Para Duda, Idea y Aviso, usar No aplica."
+    )
+    try:
+        with open(classification_guide_path, "r", encoding="utf-8") as f:
+            raw=f.read().strip()
+            if not raw:
+                if blackbox_guide_required:
+                    raise RuntimeError(f"La guía {classification_guide_path} está vacía y es obligatoria")
+                blackbox_guide_cache=default_text
+            else:
+                blackbox_guide_cache=raw
+                print(f"[INFO] Guía BlackBox cargada desde {classification_guide_path} ({len(raw)} chars)")
+    except Exception as e:
+        if blackbox_guide_required:
+            raise RuntimeError(
+                f"No se pudo leer la guía BlackBox obligatoria en {classification_guide_path}: {e}"
+            ) from e
+        print(f"[WARN] No se pudo leer {classification_guide_path}: {e}")
+        blackbox_guide_cache=default_text
+    return blackbox_guide_cache
+
+def get_blackbox_guide_excerpt():
+    guide=get_blackbox_guide_text()
+    if len(guide) <= classification_guide_max_chars:
+        return guide
+    reglas_marker="## Reglas de clasificación"
+    idx=guide.find(reglas_marker)
+    if idx == -1:
+        return guide[:classification_guide_max_chars]
+    tail_budget=max(800, classification_guide_max_chars//3)
+    tail=guide[idx:idx+tail_budget]
+    head_budget=max(400, classification_guide_max_chars - len(tail) - 8)
+    head=guide[:head_budget]
+    return f"{head}\n...\n{tail}"
 
 def fetch_messages(oldest=None, latest=None):
     c=WebClient(token=slack_bot_token)
@@ -391,7 +599,7 @@ def build_comments_from_thread(replies, root_ts):
         if not txt:
             continue
         user_id=msg.get("user")
-        author=user_display_names.get(user_id, user_id) if user_id else (msg.get("bot_id") or "desconocido")
+        author=get_user_label(user_id) if user_id else (msg.get("bot_id") or "desconocido")
         ts=msg.get("ts")
         if ts:
             fecha=tz_dt(ts).strftime("%Y-%m-%d %H:%M:%S")
@@ -414,14 +622,21 @@ def create_groq_client():
         print(f"[WARN] No se pudo crear cliente Groq: {e}")
         return None
 
-def generate_ai_summary(groq_client, main_text, comments_text):
+def generate_ai_summary(groq_client, main_text, comments_text, root_user_id=None):
     if not comments_text:
         return "Sin comentarios en el hilo. Conclusión: Sin información suficiente."
     if groq_client is None:
         return "No se pudo generar resumen IA (sin cliente Groq). Conclusión: Sin información suficiente."
 
+    root_author=get_user_label(root_user_id)
     prompt=(
         "Analiza este hilo de soporte de Slack y entrega un resumen breve.\n"
+        "Reglas de autoría (obligatorias):\n"
+        "- El autor del mensaje principal es exactamente el siguiente: "
+        f"{root_author}\n"
+        "- No confundas menciones con autoría. Un nombre/ID mencionado en el texto no implica que esa persona reportó.\n"
+        "- Si mencionas personas y existe mapeo de ID->nombre, usa el nombre. Si no existe mapeo, usa el ID.\n"
+        "- Si no hay certeza de autoría para una acción, usa redacción neutral ('se reporta', 'se comenta').\n\n"
         "Mensaje principal:\n"
         f"{sanitize_text(main_text, max_len=2000)}\n\n"
         "Comentarios del hilo:\n"
@@ -463,7 +678,9 @@ def normalize_ai_summary(text):
     s=(text or "").strip()
     s=re.sub(r"<think>.*?</think>\s*","",s,flags=re.IGNORECASE|re.DOTALL)
     s=s.replace("**","").replace("__","")
+    s=canonicalize_known_user_labels(s)
     s=sanitize_text(s)
+    s=canonicalize_known_user_labels(s)
     return s
 
 def normalize_ai_status_output(text):
@@ -485,6 +702,8 @@ def normalize_ai_status_output(text):
 
 def generate_ai_status(groq_client, main_text, comments_text):
     fallback_status=infer_auto_status(main_text)
+    if is_incident_like(f"{main_text or ''} {comments_text or ''}"):
+        return ""
     if groq_client is None:
         return fallback_status
 
@@ -524,6 +743,8 @@ def generate_ai_status(groq_client, main_text, comments_text):
         for chunk in completion:
             output.append(chunk.choices[0].delta.content or "")
         ai_status=normalize_ai_status_output("".join(output))
+        if is_incident_like(f"{main_text or ''} {comments_text or ''}"):
+            return ""
         if ai_status in {"IDEA", "Anuncio/Agradecimiento", ""}:
             return ai_status
     except Exception as e:
@@ -539,6 +760,282 @@ def normalize_for_status_matching(text):
     s=re.sub(r"\s+"," ",s).strip()
     return s
 
+def resolve_allowed_label(raw_value, allowed_labels, aliases=None, default=""):
+    normalized=normalize_for_status_matching(raw_value)
+    if not normalized:
+        return default
+    label_lookup={normalize_for_status_matching(label): label for label in allowed_labels}
+    if normalized in label_lookup:
+        return label_lookup[normalized]
+
+    compact=normalized.replace(" ","")
+    for normalized_label, original in label_lookup.items():
+        if compact == normalized_label.replace(" ",""):
+            return original
+
+    for alias, target in (aliases or {}).items():
+        alias_norm=normalize_for_status_matching(alias)
+        if normalized == alias_norm or compact == alias_norm.replace(" ",""):
+            return target
+
+    for normalized_label, original in label_lookup.items():
+        if len(normalized)>=5 and (normalized in normalized_label or normalized_label in normalized):
+            return original
+
+    return default
+
+def is_incident_like(text):
+    s=normalize_for_status_matching(text)
+    if not s:
+        return False
+    incident_signals=(
+        "error", "falla", "fallo", "problema", "incidencia", "caido", "caida",
+        "no funciona", "no carga", "no responde",
+        "no se genero", "no se generaron", "no se creo", "no se crearon",
+        "no se aplico", "no cambio", "incorrecto", "duplicado",
+        "urgente", "por favor revisar",
+    )
+    return any(sig in s for sig in incident_signals)
+
+def final_status_for_tipo(tipo_funcion):
+    if tipo_funcion == "Idea":
+        return "IDEA"
+    if tipo_funcion == "Aviso":
+        return "Anuncio/Agradecimiento"
+    return ""
+
+def infer_tipo_funcion(main_text, comments_text):
+    main=str(main_text or "")
+    merged=normalize_for_status_matching(f"{main_text or ''} {comments_text or ''}")
+    if not merged:
+        return "Incidencia"
+    if is_announcement_or_gratitude(main):
+        return "Aviso"
+    if is_idea_request(main):
+        return "Idea"
+
+    support_signals=(
+        "necesito que", "manual", "backend", "query", "script", "reactivar",
+        "cambiar estado", "borrar", "eliminar", "corregir dato", "ajustar dato",
+    )
+    if any(sig in merged for sig in support_signals):
+        return "Soporte operativo"
+
+    if is_incident_like(merged):
+        return "Incidencia"
+
+    doubt_signals=(
+        "como", "donde", "quien", "que significa", "no entiendo",
+        "se puede", "puedo", "por que", "porque",
+    )
+    if ("?" in main and not is_incident_like(merged)) or any(sig in merged for sig in doubt_signals):
+        return "Duda"
+    return "Incidencia"
+
+def infer_modulo_funcional(main_text, comments_text):
+    s=normalize_for_status_matching(f"{main_text or ''} {comments_text or ''}")
+    if any(sig in s for sig in ("cobro", "cobros", "cuota", "cuotas", "ggcc")):
+        return "Cobros"
+    mapping=[
+        ("Conciliación bancaria", ("conciliacion", "reconcili", "movimiento banc", "clearing", "cartola")),
+        ("IPC / UF / Reajuste", ("ipc", "uf", "reajuste", "banco central", "clf")),
+        ("Liquidaciones", ("liquidacion", "comision", "saldo neto")),
+        ("Pagos", ("pago", "paymentintent", "fintoc", "nomina", "transferencia")),
+        ("Cobros", ("cobro", "cuota", "multa", "deuda", "ggcc")),
+        ("Contratos", ("contrato", "anexo", "renovacion", "garantia", "reserva")),
+        ("Propiedades / Unidades", ("propiedad", "unidad", "departamento", "amenidad", "tipologia")),
+        ("Stakeholders / Figuras", ("stakeholder", "owner", "person", "company", "figura", "propietario")),
+        ("Portal Arrendatarios", ("portal", "arrendatario", "co deudor", "debtnotification", "link de pago")),
+        ("CRM / Bot WhatsApp", ("whatsapp", "lead", "funnel", "conversation", "bot")),
+        ("Corretaje", ("corretaje", "broker", "keybox", "mercadolibre", "prospect", "visita")),
+        ("Planner", ("planner", "kanban", "notebook", "card", "tarjeta")),
+        ("Servicios básicos", ("agua andina", "enel", "servicios basicos", "servicio basico")),
+        ("Reportes / Exports", ("reporte", "excel", "zip", "pdf", "rentroll", "export")),
+        ("Permisos / Auth", ("permiso", "rol", "auth", "login", "contrasena", "password")),
+        ("Infraestructura", ("infraestructura", "worker", "celery", "s3", "sqs", "vercel", "timeout", "deploy")),
+    ]
+    for label, signals in mapping:
+        if any(sig in s for sig in signals):
+            return label
+    return "Infraestructura"
+
+def infer_causa_raiz(tipo_funcion, main_text, comments_text):
+    if tipo_funcion not in causa_raiz_requerida_para:
+        return "No aplica"
+    s=normalize_for_status_matching(f"{main_text or ''} {comments_text or ''}")
+    if not s:
+        return "Desconocido"
+    if any(sig in s for sig in ("legacy", "historico", "migracion", "dato antiguo", "version anterior")):
+        return "Dato legacy / Dato histórico con problemas"
+    if any(sig in s for sig in ("fintoc", "mercadolibre", "microsoft graph", "api banco central", "agua andina", "enel", "tuya")):
+        return "Integración externa"
+    if any(sig in s for sig in ("timeout", "504", "lento", "degradacion", "saturacion", "performance")):
+        return "Performance"
+    if any(sig in s for sig in ("deploy", "configuracion", "entorno", "produccion", "variable de entorno")):
+        return "Configuración / Deploy"
+    if any(sig in s for sig in ("no se probo", "no probado", "falta test", "qa", "regresion")):
+        return "Gap de QA"
+    if any(sig in s for sig in ("no entiende", "confusion", "capacitacion", "usabilidad", "ux")):
+        return "UX / Capacitación"
+    if any(sig in s for sig in ("caso borde", "no contemplado", "escenario especial")):
+        return "Caso borde no cubierto"
+    if any(sig in s for sig in ("regla", "calculo", "logica", "estado incorrecto", "duplicado")):
+        return "Lógica de negocio"
+    if any(sig in s for sig in ("no reproducible", "sin contexto", "falta informacion", "ambiguo")):
+        return "Desconocido"
+    return "Desconocido"
+
+def infer_blackbox_classification(main_text, comments_text):
+    tipo=infer_tipo_funcion(main_text, comments_text)
+    modulo=infer_modulo_funcional(main_text, comments_text)
+    causa=infer_causa_raiz(tipo, main_text, comments_text)
+    return {
+        "tipo_funcion": tipo,
+        "modulo_funcional": modulo,
+        "causa_raiz": causa,
+    }
+
+def parse_blackbox_classification_output(text):
+    payload={}
+    raw=(text or "").strip()
+    if not raw:
+        return payload
+
+    candidate_blocks=[raw]
+    if "```" in raw:
+        candidate_blocks.extend(re.findall(r"```(?:json)?\s*(.*?)```", raw, flags=re.IGNORECASE|re.DOTALL))
+    json_like=re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if json_like:
+        candidate_blocks.append(json_like.group(0))
+
+    for candidate in candidate_blocks:
+        content=(candidate or "").strip()
+        if not content:
+            continue
+        try:
+            obj=json.loads(content)
+            if isinstance(obj, dict):
+                payload=obj
+                break
+        except Exception:
+            continue
+
+    if payload:
+        return payload
+
+    line_patterns={
+        "tipo_funcion": r"(?:tipo[_\s]*funcion|tipo[_\s]*entrada)\s*[:=]\s*(.+)",
+        "modulo_funcional": r"(?:modulo[_\s]*funcional)\s*[:=]\s*(.+)",
+        "causa_raiz": r"(?:causa[_\s]*raiz)\s*[:=]\s*(.+)",
+    }
+    for key, pattern in line_patterns.items():
+        m=re.search(pattern, raw, flags=re.IGNORECASE)
+        if m:
+            payload[key]=sanitize_text(m.group(1), max_len=200)
+    return payload
+
+def generate_blackbox_classification(groq_client, main_text, comments_text):
+    fallback=infer_blackbox_classification(main_text, comments_text)
+    if groq_client is None:
+        if strict_md_classification:
+            print("[WARN] Modo estricto .md: sin cliente Groq, usando clasificador determinístico basado en guía.")
+        return fallback
+
+    guide_text=get_blackbox_guide_excerpt()
+    def build_prompt(guide_excerpt):
+        return (
+            "Usa la guía de clasificación del BlackBox y clasifica el mensaje en 3 dimensiones.\n"
+            "Responde SOLO JSON válido (sin markdown) con este formato exacto:\n"
+            "{\"tipo_funcion\":\"...\",\"modulo_funcional\":\"...\",\"causa_raiz\":\"...\"}\n\n"
+            "Etiquetas permitidas para tipo_funcion:\n"
+            + "\n".join(f"- {x}" for x in tipo_funcion_labels) + "\n\n"
+            "Etiquetas permitidas para modulo_funcional:\n"
+            + "\n".join(f"- {x}" for x in modulo_funcional_labels) + "\n\n"
+            "Etiquetas permitidas para causa_raiz:\n"
+            + "\n".join(f"- {x}" for x in causa_raiz_labels) + "\n\n"
+            "Reglas obligatorias:\n"
+            "- Si tipo_funcion es Duda, Idea o Aviso, causa_raiz debe ser 'No aplica'.\n"
+            "- Si tipo_funcion es Incidencia o Soporte operativo y no hay evidencia suficiente, usar 'Desconocido'.\n"
+            "- Elegir siempre una sola etiqueta por dimensión.\n\n"
+            "Heurísticas clave para evitar errores:\n"
+            "- Mensajes informativos de despliegue/automatización (ej: 'se creó alerta automática', 'ya quedó habilitado') => tipo_funcion='Aviso'.\n"
+            "- Mensajes de falla operativa (ej: 'no se generaron cobros', 'da error', 'no funciona') => tipo_funcion='Incidencia'.\n"
+            "- Si el texto menciona 'cobro/cobros/cuotas/GGCC', priorizar modulo_funcional='Cobros'.\n\n"
+            "Guía base:\n"
+            f"{guide_excerpt}\n\n"
+            "Mensaje principal:\n"
+            f"{sanitize_text(main_text, max_len=1800)}\n\n"
+            "Comentarios del hilo:\n"
+            f"{sanitize_text(comments_text, max_len=2500)}\n"
+        )
+
+    def request_payload(prompt_text):
+        completion=groq_client.chat.completions.create(
+            model=groq_model,
+            messages=[{"role":"user","content":prompt_text}],
+            temperature=0,
+            max_completion_tokens=256,
+            top_p=1,
+            reasoning_effort="default",
+            stream=False,
+            stop=None
+        )
+        content=completion.choices[0].message.content or ""
+        return parse_blackbox_classification_output(content), content
+
+    try:
+        payload={}
+        raw_output=""
+        prompt_variants=[
+            build_prompt(guide_text),
+            build_prompt(guide_text[:1400]),
+        ]
+        for prompt in prompt_variants:
+            payload, raw_output=request_payload(prompt)
+            if payload:
+                break
+
+        tipo=resolve_allowed_label(payload.get("tipo_funcion"), tipo_funcion_labels, tipo_funcion_aliases, default="")
+        modulo=resolve_allowed_label(payload.get("modulo_funcional"), modulo_funcional_labels, modulo_funcional_aliases, default="")
+        causa=resolve_allowed_label(payload.get("causa_raiz"), causa_raiz_labels, causa_raiz_aliases, default="")
+
+        if strict_md_classification and (not tipo or not modulo or not causa):
+            print(
+                "[WARN] Modo estricto .md: salida IA inválida, "
+                f"usando clasificador determinístico. payload={payload}, raw={sanitize_text(raw_output, max_len=220)}"
+            )
+            return fallback
+
+        result={
+            "tipo_funcion": tipo or fallback["tipo_funcion"],
+            "modulo_funcional": modulo or fallback["modulo_funcional"],
+            "causa_raiz": causa or fallback["causa_raiz"],
+        }
+
+        merged_text=f"{main_text or ''} {comments_text or ''}"
+        normalized_merged=normalize_for_status_matching(merged_text)
+        if is_announcement_or_gratitude(main_text):
+            result["tipo_funcion"]="Aviso"
+        elif is_incident_like(merged_text):
+            result["tipo_funcion"]="Incidencia"
+        if any(sig in normalized_merged for sig in ("cobro", "cobros", "cuota", "cuotas", "ggcc")):
+            result["modulo_funcional"]="Cobros"
+
+        if result["tipo_funcion"] not in causa_raiz_requerida_para:
+            result["causa_raiz"]="No aplica"
+        elif result["causa_raiz"]=="No aplica":
+            result["causa_raiz"]=fallback["causa_raiz"] or "Desconocido"
+        return result
+    except Exception as e:
+        if strict_md_classification:
+            print(
+                "[WARN] Modo estricto .md: error de IA, "
+                f"usando clasificador determinístico. error={e}"
+            )
+            return fallback
+        print(f"[WARN] Error clasificando BlackBox con IA: {e}")
+        return fallback
+
 def is_idea_request(text):
     s=normalize_for_status_matching(text)
     if not s:
@@ -553,6 +1050,8 @@ def is_announcement_or_gratitude(text):
     s=normalize_for_status_matching(text)
     if not s:
         return False
+    if is_incident_like(s):
+        return False
     announcement_signals=(
         "pasando a produccion",
         "a produccion",
@@ -561,6 +1060,13 @@ def is_announcement_or_gratitude(text):
         "nuevos elementos",
         "se agrego a produccion",
         "ya esta en produccion",
+        "ya esta disponible",
+        "ya quedo",
+        "se creo alerta",
+        "se creo automatica",
+        "se creo automatizacion",
+        "se habilito",
+        "se implemento",
         "deploy",
         "despliegue",
         "gracias por su paciencia",
@@ -595,6 +1101,8 @@ def is_announcement_or_gratitude(text):
     )
 
 def infer_auto_status(main_text):
+    if is_incident_like(main_text):
+        return ""
     if is_idea_request(main_text):
         return "IDEA"
     if is_announcement_or_gratitude(main_text):
@@ -622,7 +1130,6 @@ def build_df(msgs, existing_keys=None):
             continue
 
         dt=tz_dt(ts)
-        origen="Producto" if uid in dev_team_member_ids else "Otras áreas"
 
         comments_for_ai=""
         reply_count=int(m.get("reply_count",0) or 0)
@@ -632,14 +1139,16 @@ def build_df(msgs, existing_keys=None):
             comments_for_ai=build_comments_from_thread(replies, ts)
 
         main_text=m.get("text","")
-        resumen_ia=generate_ai_summary(groq_client, main_text, comments_for_ai)
-        auto_status=generate_ai_status(groq_client, main_text, comments_for_ai)
+        resumen_ia=generate_ai_summary(groq_client, main_text, comments_for_ai, root_user_id=uid)
+        blackbox_classification=generate_blackbox_classification(groq_client, main_text, comments_for_ai)
+        auto_status=final_status_for_tipo(blackbox_classification["tipo_funcion"])
 
         datos.append({
             "Fecha aproximada":dt.strftime("%Y-%m-%d %H:%M:%S"),
-            "Origen":origen,
             "SLACK":slack_content,
-            "Funcionalidad Backend/Frontend":"",
+            "Tipo de función":blackbox_classification["tipo_funcion"],
+            "Módulo funcional":blackbox_classification["modulo_funcional"],
+            "Causa raíz":blackbox_classification["causa_raiz"],
             "Comentarios":"",
             "Categoría Soporte (estandarizado para reportes)":"",
             "Propuesta (Tarea en ClickUp cuando sea desarrollable /Cambio sistema)":"",
@@ -731,10 +1240,11 @@ def apply_table_style(ws, num_rows):
         # Ajustar ancho de columnas por nombre (robusto si el orden cambia)
         column_widths_by_name = {
             "Fecha aproximada": 23,
-            "Origen": 18,
             "SLACK": 60,
-            "Funcionalidad Backend/Frontend": 30,
-            "Comentarios": 65,
+            "Tipo de función": 20,
+            "Módulo funcional": 26,
+            "Causa raíz": 30,
+            "Comentarios": 30,
             "Categoría Soporte (estandarizado para reportes)": 42,
             "Propuesta (Tarea en ClickUp cuando sea desarrollable /Cambio sistema)": 48,
             "ESTADO FINAL": 22,
@@ -767,7 +1277,7 @@ def collect_existing_slack_keys(wb):
         ws=wb[sheet_name]
         if ws.max_row<=1:
             continue
-        slack_col=get_column_index(ws, "SLACK", fallback=3)
+        slack_col=get_column_index(ws, "SLACK", fallback=2)
         if slack_col is None:
             continue
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
@@ -783,7 +1293,7 @@ def collect_existing_row_locations(wb):
         ws=wb[sheet_name]
         if ws.max_row<=1:
             continue
-        slack_col=get_column_index(ws, "SLACK", fallback=3)
+        slack_col=get_column_index(ws, "SLACK", fallback=2)
         if slack_col is None:
             continue
         for row_idx in range(2, ws.max_row+1):
@@ -798,13 +1308,16 @@ def collect_existing_row_locations(wb):
 
 def backfill_ai_for_existing_rows(wb, msgs, existing_row_locations):
     if not msgs or not existing_row_locations:
-        return 0, 0, 0
+        return 0, 0, 0, 0
 
     slack_client=WebClient(token=slack_bot_token)
     groq_client=create_groq_client()
+    reclassify_existing=(os.environ.get("RECLASSIFY_EXISTING", "0").strip()=="1")
+    clear_non_ai_columns=(os.environ.get("CLEAR_NON_AI_COLUMNS", "0").strip()=="1")
     checked=0
     summary_updated=0
     status_updated=0
+    classification_updated=0
 
     for m in reversed(msgs):
         uid=m.get("user")
@@ -823,22 +1336,47 @@ def backfill_ai_for_existing_rows(wb, msgs, existing_row_locations):
         summary_col=get_column_index(ws, "resumen ia", fallback=9)
         if summary_col is None:
             continue
+        tipo_col=get_column_index(ws, "Tipo de función")
+        modulo_col=get_column_index(ws, "Módulo funcional")
+        causa_col=get_column_index(ws, "Causa raíz")
+        comentarios_col=get_column_index(ws, "Comentarios")
+        categoria_col=get_column_index(ws, "Categoría Soporte (estandarizado para reportes)")
+
         status_cell=ws.cell(row=row_idx, column=status_col) if status_col is not None else None
         summary_cell=ws.cell(row=row_idx, column=summary_col)
+        tipo_cell=ws.cell(row=row_idx, column=tipo_col) if tipo_col is not None else None
+        modulo_cell=ws.cell(row=row_idx, column=modulo_col) if modulo_col is not None else None
+        causa_cell=ws.cell(row=row_idx, column=causa_col) if causa_col is not None else None
+        comentarios_cell=ws.cell(row=row_idx, column=comentarios_col) if comentarios_col is not None else None
+        categoria_cell=ws.cell(row=row_idx, column=categoria_col) if categoria_col is not None else None
+
         has_status=bool(str(status_cell.value or "").strip()) if status_cell is not None else False
         has_summary=bool(str(summary_cell.value or "").strip())
+        has_tipo=bool(str(tipo_cell.value or "").strip()) if tipo_cell is not None else False
+        has_modulo=bool(str(modulo_cell.value or "").strip()) if modulo_cell is not None else False
+        has_causa=bool(str(causa_cell.value or "").strip()) if causa_cell is not None else False
 
         main_text=m.get("text","")
-        auto_status=infer_auto_status(main_text)
+        current_tipo=str(tipo_cell.value or "").strip() if tipo_cell is not None else ""
+        auto_status=final_status_for_tipo(current_tipo)
         needs_status_update=(not has_status) and bool(auto_status)
         needs_summary_update=(not has_summary)
+        needs_classification_update=any(
+            (
+                not has_tipo,
+                not has_modulo,
+                not has_causa,
+            )
+        )
+        if reclassify_existing:
+            needs_classification_update=True
 
         if needs_status_update and status_cell is not None:
             status_cell.value=auto_status
             has_status=True
             status_updated+=1
 
-        if not needs_summary_update:
+        if not needs_summary_update and not needs_classification_update:
             continue
 
         comments_for_ai=""
@@ -848,18 +1386,48 @@ def backfill_ai_for_existing_rows(wb, msgs, existing_row_locations):
             replies=fetch_thread_replies(slack_client, thread_ts)
             comments_for_ai=build_comments_from_thread(replies, ts)
 
-        new_summary=normalize_ai_summary(generate_ai_summary(groq_client, main_text, comments_for_ai))
-        checked+=1
-        if new_summary and new_summary != str(summary_cell.value or "").strip():
-            summary_cell.value=new_summary
-            summary_updated+=1
+        if needs_summary_update:
+            new_summary=normalize_ai_summary(
+                generate_ai_summary(groq_client, main_text, comments_for_ai, root_user_id=uid)
+            )
+            checked+=1
+            if new_summary and new_summary != str(summary_cell.value or "").strip():
+                summary_cell.value=new_summary
+                summary_updated+=1
 
-    if checked or status_updated:
+        if needs_classification_update:
+            classification=generate_blackbox_classification(groq_client, main_text, comments_for_ai)
+            updated_current_row=False
+            if tipo_cell is not None and ((not has_tipo) or str(tipo_cell.value or "").strip() != classification["tipo_funcion"]):
+                tipo_cell.value=classification["tipo_funcion"]
+                updated_current_row=True
+            if modulo_cell is not None and ((not has_modulo) or str(modulo_cell.value or "").strip() != classification["modulo_funcional"]):
+                modulo_cell.value=classification["modulo_funcional"]
+                updated_current_row=True
+            if causa_cell is not None and ((not has_causa) or str(causa_cell.value or "").strip() != classification["causa_raiz"]):
+                causa_cell.value=classification["causa_raiz"]
+                updated_current_row=True
+            if status_cell is not None:
+                status_for_tipo=final_status_for_tipo(classification["tipo_funcion"])
+                current_status=str(status_cell.value or "").strip()
+                if current_status != status_for_tipo:
+                    status_cell.value=status_for_tipo
+                    status_updated+=1
+            if clear_non_ai_columns:
+                for cell in (comentarios_cell, categoria_cell):
+                    if cell is not None and str(cell.value or "").strip() != "":
+                        cell.value=""
+                        updated_current_row=True
+            if updated_current_row:
+                classification_updated+=1
+
+    if checked or status_updated or classification_updated:
         print(
-            "[INFO] Backfill IA/estado sobre filas existentes: "
-            f"revisadas={checked}, resumen_actualizado={summary_updated}, estado_actualizado={status_updated}"
+            "[INFO] Backfill IA/estado/clasificación sobre filas existentes: "
+            f"revisadas={checked}, resumen_actualizado={summary_updated}, "
+            f"estado_actualizado={status_updated}, clasificacion_actualizada={classification_updated}"
         )
-    return checked, summary_updated, status_updated
+    return checked, summary_updated, status_updated, classification_updated
 
 def normalize_header_row(ws):
     return [str(ws.cell(row=1, column=idx).value).strip() if ws.cell(row=1, column=idx).value is not None else "" for idx in range(1, ws.max_column + 1)]
@@ -886,21 +1454,28 @@ def build_row_values_for_sheet(ws, row_dict):
 def migrate_sheet_headers(ws):
     # Migración no destructiva: nunca borra filas/celdas existentes.
     added_any=False
-    legacy_idx=get_column_index(ws, legacy_diagnosis_column)
-    comentarios_idx, comentarios_added = ensure_column_exists(ws, "Comentarios")
-    if comentarios_added:
-        added_any=True
-        if legacy_idx is not None and ws.max_row > 1:
-            for row_idx in range(2, ws.max_row + 1):
-                legacy_val=ws.cell(row=row_idx, column=legacy_idx).value
-                current_val=ws.cell(row=row_idx, column=comentarios_idx).value
-                if (current_val is None or str(current_val).strip()=="") and legacy_val not in (None, ""):
-                    ws.cell(row=row_idx, column=comentarios_idx, value=legacy_val)
 
     for col_name in expected_columns:
         _, added = ensure_column_exists(ws, col_name)
         if added:
             added_any=True
+
+    legacy_idx=get_column_index(ws, legacy_diagnosis_column)
+    causa_idx=get_column_index(ws, "Causa raíz")
+    comentarios_idx=get_column_index(ws, "Comentarios")
+    if legacy_idx is not None and ws.max_row > 1 and (causa_idx is not None or comentarios_idx is not None):
+        for row_idx in range(2, ws.max_row + 1):
+            legacy_val=ws.cell(row=row_idx, column=legacy_idx).value
+            if legacy_val in (None, ""):
+                continue
+            if causa_idx is not None:
+                current_causa=ws.cell(row=row_idx, column=causa_idx).value
+                if current_causa is None or str(current_causa).strip()=="":
+                    ws.cell(row=row_idx, column=causa_idx, value=legacy_val)
+            if comentarios_idx is not None:
+                current_comentario=ws.cell(row=row_idx, column=comentarios_idx).value
+                if current_comentario is None or str(current_comentario).strip()=="":
+                    ws.cell(row=row_idx, column=comentarios_idx, value=legacy_val)
 
     return added_any
 
@@ -908,7 +1483,7 @@ def repair_invalid_hyperlinks_in_sheet(ws):
     repaired=0
     if ws.max_row<=1:
         return repaired
-    slack_col=get_column_index(ws, "SLACK", fallback=3)
+    slack_col=get_column_index(ws, "SLACK", fallback=2)
     if slack_col is None:
         return repaired
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row, min_col=slack_col, max_col=slack_col):
@@ -984,7 +1559,7 @@ def append_rows(wb,df):
     
     # Obtener claves existentes para verificar duplicados (preferimos URL del mensaje de Slack)
     existing_keys = set()
-    slack_col=get_column_index(ws, "SLACK", fallback=3)
+    slack_col=get_column_index(ws, "SLACK", fallback=2)
     if ws.max_row > 1:  # Si hay datos además del header
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row, values_only=True):
             if slack_col is not None and len(row) >= slack_col and row[slack_col-1]:
@@ -1015,13 +1590,23 @@ def append_rows(wb,df):
 
 def main():
     print(f"[INFO] Inicio ejecución: {now_scl()}")
-    print(f"[INFO] Modo ejecución: {run_mode} | OneDrive destino: {onedrive_file_path}")
-    token=acquire_token()
-    print("[INFO] Access token obtenido")
+    get_blackbox_guide_text()
+    print(f"[INFO] Clasificación por guía .md estricta: {strict_md_classification}")
 
-    ensure_file(token)
+    token=None
+    if local_mode:
+        print(f"[INFO] Modo ejecución: {run_mode} | Excel local: {os.path.abspath(local_excel_path)}")
+        ensure_local_file(local_excel_path)
+        bio=dl_excel_local(local_excel_path)
+    else:
+        if not onedrive_upn:
+            raise RuntimeError("Falta ONEDRIVE_UPN para ejecución con OneDrive")
+        print(f"[INFO] Modo ejecución: {run_mode} | OneDrive destino: {onedrive_file_path}")
+        token=acquire_token()
+        print("[INFO] Access token obtenido")
+        ensure_file(token)
+        bio=dl_excel(token)
 
-    bio=dl_excel(token)
     try:
         wb=load_workbook(bio)
         print("[INFO] Excel cargado")
@@ -1038,16 +1623,33 @@ def main():
     # Ejecutar siempre, sin restricción de hora
     print(f"[INFO] Ejecutando sin restricción de hora (debug_mode: {debug_mode})")
 
-    # Últimos 4 días (en horario Chile): desde 00:00 del día (hoy - 3) hasta ahora
+    # Ventana Slack configurable por días hacia atrás (en horario Chile).
+    # Para pruebas locales, por defecto usa solo hoy (0 días).
+    lookback_days_default="0" if local_mode else "3"
+    lookback_days_raw=os.environ.get("SLACK_LOOKBACK_DAYS", lookback_days_default).strip() or lookback_days_default
+    try:
+        lookback_days=max(0, int(lookback_days_raw))
+    except ValueError:
+        print(f"[WARN] SLACK_LOOKBACK_DAYS inválido: {lookback_days_raw}. Usando {lookback_days_default}.")
+        lookback_days=int(lookback_days_default)
+
     now_local = now_scl()
-    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=3)
+    start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=lookback_days)
     oldest = str(start_local.astimezone(timezone.utc).timestamp())
     latest = str(datetime.now(tz=timezone.utc).timestamp())
-    print(f"[INFO] Ventana Slack últimos 4 días (hora Chile): {start_local} hasta {now_local}")
+    if lookback_days == 0:
+        print(f"[INFO] Ventana Slack: solo hoy (hora Chile): {start_local} hasta {now_local}")
+    else:
+        print(f"[INFO] Ventana Slack: últimos {lookback_days + 1} días (hora Chile): {start_local} hasta {now_local}")
     msgs = fetch_messages(oldest=oldest, latest=latest)
 
     print(f"[INFO] Mensajes obtenidos: {len(msgs)}")
-    _, backfilled_ai, backfilled_status = backfill_ai_for_existing_rows(wb, msgs, existing_row_locations)
+    enable_backfill=(os.environ.get("ENABLE_BACKFILL","0").strip()=="1")
+    if enable_backfill:
+        _, backfilled_ai, backfilled_status, backfilled_classification = backfill_ai_for_existing_rows(wb, msgs, existing_row_locations)
+    else:
+        backfilled_ai, backfilled_status, backfilled_classification = 0, 0, 0
+        print("[INFO] Backfill sobre filas existentes desactivado (ENABLE_BACKFILL=0)")
     df=build_df(msgs, existing_keys=existing_slack_keys)
     workbook_changed = (
         migrated_sheets > 0
@@ -1055,6 +1657,7 @@ def main():
         or ai_cleaned > 0
         or backfilled_ai > 0
         or backfilled_status > 0
+        or backfilled_classification > 0
     )
     if not df.empty:
         print(f"[INFO] Filas a agregar: {len(df)}")
@@ -1072,12 +1675,18 @@ def main():
     wb.save(out)
     out.seek(0)
     
-    # Intentar subir a OneDrive
-    upload_success = up_excel(token,out)
-    if upload_success:
-        print(f"[INFO] Excel actualizado en OneDrive: {onedrive_file_path}")
+    if local_mode:
+        upload_success = up_excel_local(local_excel_path, out)
+        if upload_success:
+            print(f"[INFO] Excel actualizado en local: {os.path.abspath(local_excel_path)}")
+        else:
+            print("[WARN] No se pudo guardar Excel local, pero el procesamiento se completó")
     else:
-        print(f"[WARN] No se pudo actualizar OneDrive, pero el procesamiento se completó exitosamente")
+        upload_success = up_excel(token,out)
+        if upload_success:
+            print(f"[INFO] Excel actualizado en OneDrive: {onedrive_file_path}")
+        else:
+            print(f"[WARN] No se pudo actualizar OneDrive, pero el procesamiento se completó exitosamente")
 
     print(f"[INFO] Fin ejecución: {now_scl()}")
 
