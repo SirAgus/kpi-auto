@@ -433,45 +433,50 @@ def dl_excel(token):
 
 def up_excel(token,bio):
     url=f"https://graph.microsoft.com/v1.0/users/{onedrive_upn}/drive/root:{onedrive_file_path}:/content"
-    try:
-        gput(url,token,bio.getvalue(),"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        print(f"[INFO] Archivo subido exitosamente a OneDrive")
-        return True
-    except Exception as e:
-        print(f"[ERROR] Error al subir archivo: {e}")
-        
-        # Si el archivo está bloqueado (423) o en conflicto (409), crear una copia con timestamp
-        if "423" in str(e) or "409" in str(e):
-            try:
-                # Crear nombre de archivo con timestamp
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                # Obtener el directorio y nombre base del archivo original
-                base_path = onedrive_file_path.rsplit('/', 1)[0] if '/' in onedrive_file_path else ""
-                base_name = onedrive_file_path.rsplit('/', 1)[-1].rsplit('.', 1)[0] if '.' in onedrive_file_path else onedrive_file_path
-                extension = onedrive_file_path.rsplit('.', 1)[-1] if '.' in onedrive_file_path else "xlsx"
-                
-                # Crear nueva ruta con timestamp
-                backup_path = f"{base_path}/{base_name}_backup_{timestamp}.{extension}" if base_path else f"{base_name}_backup_{timestamp}.{extension}"
-                backup_url = f"https://graph.microsoft.com/v1.0/users/{onedrive_upn}/drive/root:{backup_path}:/content"
-                
-                # Subir la copia
-                gput(backup_url, token, bio.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                print(f"[INFO] Archivo bloqueado - copia creada en OneDrive: {backup_path}")
-                return True
-                
-            except Exception as backup_error:
-                print(f"[ERROR] Error al crear copia en OneDrive: {backup_error}")
-        
-        # Guardar archivo localmente como respaldo adicional
-        backup_filename = f"backup_blackbox_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+    def save_local_backup():
+        backup_filename=f"backup_blackbox_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
         try:
-            with open(backup_filename, 'wb') as f:
+            with open(backup_filename, "wb") as f:
                 f.write(bio.getvalue())
             print(f"[INFO] Archivo guardado localmente como respaldo: {backup_filename}")
         except Exception as backup_error:
             print(f"[WARN] No se pudo guardar respaldo local: {backup_error}")
-        
-        # No lanzar excepción, solo reportar el error
+
+    try:
+        response=gput(url,token,bio.getvalue(),"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        status_code=getattr(response, "status_code", 500)
+        if status_code < 400:
+            print(f"[INFO] Archivo subido exitosamente a OneDrive")
+            return True
+
+        if status_code in [423, 409]:
+            print("[WARN] No se actualizó el archivo principal por lock/conflicto (423/409)")
+            try:
+                timestamp=datetime.now().strftime("%Y%m%d_%H%M%S")
+                base_path=onedrive_file_path.rsplit("/", 1)[0] if "/" in onedrive_file_path else ""
+                base_name=onedrive_file_path.rsplit("/", 1)[-1].rsplit(".", 1)[0] if "." in onedrive_file_path else onedrive_file_path
+                extension=onedrive_file_path.rsplit(".", 1)[-1] if "." in onedrive_file_path else "xlsx"
+
+                backup_path=f"{base_path}/{base_name}_backup_{timestamp}.{extension}" if base_path else f"{base_name}_backup_{timestamp}.{extension}"
+                backup_url=f"https://graph.microsoft.com/v1.0/users/{onedrive_upn}/drive/root:{backup_path}:/content"
+                backup_response=gput(backup_url, token, bio.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                if getattr(backup_response, "status_code", 500) < 400:
+                    print(f"[INFO] Archivo bloqueado - copia creada en OneDrive: {backup_path}")
+                else:
+                    print(f"[WARN] No se pudo crear copia en OneDrive (status={backup_response.status_code})")
+            except Exception as backup_error:
+                print(f"[ERROR] Error al crear copia en OneDrive: {backup_error}")
+
+            save_local_backup()
+            return False
+
+        print(f"[ERROR] Error al subir archivo (status={status_code})")
+        save_local_backup()
+        print(f"[WARN] Continuando sin subir a OneDrive debido al error")
+        return False
+    except Exception as e:
+        print(f"[ERROR] Error al subir archivo: {e}")
+        save_local_backup()
         print(f"[WARN] Continuando sin subir a OneDrive debido al error")
         return False
 
@@ -1328,6 +1333,7 @@ def backfill_ai_for_existing_rows(wb, msgs, existing_row_locations):
     groq_client=create_groq_client()
     reclassify_existing=(os.environ.get("RECLASSIFY_EXISTING", "0").strip()=="1")
     clear_non_ai_columns=(os.environ.get("CLEAR_NON_AI_COLUMNS", "0").strip()=="1")
+    force_reclassify_misclassified=(os.environ.get("FORCE_RECLASSIFY_MISCLASSIFIED", "1").strip()=="1")
     checked=0
     summary_updated=0
     status_updated=0
@@ -1375,6 +1381,16 @@ def backfill_ai_for_existing_rows(wb, msgs, existing_row_locations):
         auto_status=final_status_for_tipo(current_tipo)
         needs_status_update=(not has_status) and bool(auto_status)
         needs_summary_update=(not has_summary)
+        existing_status=str(status_cell.value or "").strip() if status_cell is not None else ""
+        incident_like_main=is_incident_like(main_text)
+        force_reclassify=(
+            force_reclassify_misclassified
+            and incident_like_main
+            and (
+                current_tipo=="Idea"
+                or existing_status=="IDEA"
+            )
+        )
         needs_classification_update=any(
             (
                 not has_tipo,
@@ -1384,6 +1400,9 @@ def backfill_ai_for_existing_rows(wb, msgs, existing_row_locations):
         )
         if reclassify_existing:
             needs_classification_update=True
+        if force_reclassify:
+            needs_classification_update=True
+            print(f"[INFO] Reclasificación forzada por señales de incidencia (ts={ts})")
 
         if needs_status_update and status_cell is not None:
             status_cell.value=auto_status
@@ -1658,7 +1677,7 @@ def main():
     msgs = fetch_messages(oldest=oldest, latest=latest)
 
     print(f"[INFO] Mensajes obtenidos: {len(msgs)}")
-    enable_backfill=(os.environ.get("ENABLE_BACKFILL","0").strip()=="1")
+    enable_backfill=(os.environ.get("ENABLE_BACKFILL","1").strip()=="1")
     if enable_backfill:
         _, backfilled_ai, backfilled_status, backfilled_classification = backfill_ai_for_existing_rows(wb, msgs, existing_row_locations)
     else:
