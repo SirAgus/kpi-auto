@@ -49,6 +49,9 @@ device_flow_wait_seconds=int(os.environ.get("DEVICE_FLOW_WAIT_SECONDS","600"))  
 graph_scope=os.environ.get("GRAPH_SCOPE","offline_access Files.ReadWrite").strip() or "offline_access Files.ReadWrite"
 groq_api_key=os.environ.get("GROQ_API_KEY","").strip()
 groq_model=os.environ.get("GROQ_MODEL","qwen/qwen3-32b").strip() or "qwen/qwen3-32b"
+gemini_api_key=os.environ.get("GEMINI_API_KEY","").strip()
+gemini_model=os.environ.get("GEMINI_MODEL","gemini-2.5-flash").strip() or "gemini-2.5-flash"
+ai_provider_preference=(os.environ.get("AI_PROVIDER","auto").strip().lower() or "auto")
 
 expected_columns=[
     "Fecha aproximada",
@@ -630,10 +633,12 @@ def build_comments_from_thread(replies, root_ts):
 
 def create_groq_client():
     if not groq_api_key:
-        print("[WARN] GROQ_API_KEY no configurada; 'resumen ia' se completará con fallback.")
+        if not gemini_api_key:
+            print("[WARN] GROQ_API_KEY no configurada y GEMINI_API_KEY ausente; se usará fallback.")
         return None
     if Groq is None:
-        print("[WARN] Librería groq no instalada; 'resumen ia' se completará con fallback.")
+        if not gemini_api_key:
+            print("[WARN] Librería groq no instalada y GEMINI_API_KEY ausente; se usará fallback.")
         return None
     try:
         return Groq(api_key=groq_api_key)
@@ -641,11 +646,95 @@ def create_groq_client():
         print(f"[WARN] No se pudo crear cliente Groq: {e}")
         return None
 
+def call_gemini_text(prompt, max_output_tokens=1024, temperature=0, response_mime_type=None):
+    if not gemini_api_key:
+        return ""
+    url=f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_api_key}"
+    generation_config={
+        "temperature": temperature,
+        "maxOutputTokens": max(32, int(max_output_tokens)),
+    }
+    if response_mime_type:
+        generation_config["responseMimeType"]=response_mime_type
+    payload={
+        "contents":[{"parts":[{"text": prompt}]}],
+        "generationConfig": generation_config,
+    }
+    try:
+        r=requests.post(url, json=payload, timeout=45)
+        if r.status_code >= 400:
+            print(f"[WARN] Gemini error HTTP {r.status_code}: {sanitize_text(r.text, max_len=300)}")
+            return ""
+        data=r.json()
+        texts=[]
+        for cand in data.get("candidates", []):
+            content=(cand or {}).get("content") or {}
+            for part in content.get("parts", []):
+                txt=(part or {}).get("text")
+                if txt:
+                    texts.append(txt)
+        return "\n".join(texts).strip()
+    except Exception as e:
+        print(f"[WARN] Error llamando Gemini: {e}")
+        return ""
+
+def call_groq_text(groq_client, prompt, max_completion_tokens=1024, temperature=0, top_p=1, stream=False):
+    if groq_client is None:
+        return ""
+    try:
+        completion=groq_client.chat.completions.create(
+            model=groq_model,
+            messages=[{"role":"user","content":prompt}],
+            temperature=temperature,
+            max_completion_tokens=max_completion_tokens,
+            top_p=top_p,
+            reasoning_effort="default",
+            stream=stream,
+            stop=None
+        )
+        if stream:
+            output=[]
+            for chunk in completion:
+                output.append(chunk.choices[0].delta.content or "")
+            return "".join(output).strip()
+        return (completion.choices[0].message.content or "").strip()
+    except Exception as e:
+        print(f"[WARN] Error llamando Groq: {e}")
+        return ""
+
+def generate_llm_text(groq_client, prompt, max_completion_tokens=1024, temperature=0, top_p=1, stream=False, response_mime_type=None):
+    provider=ai_provider_preference if ai_provider_preference in {"auto", "gemini", "groq"} else "auto"
+    orders={
+        "gemini": ("gemini", "groq"),
+        "groq": ("groq", "gemini"),
+        "auto": ("gemini", "groq") if gemini_api_key else ("groq", "gemini"),
+    }
+    for candidate in orders[provider]:
+        if candidate=="gemini":
+            out=call_gemini_text(
+                prompt=prompt,
+                max_output_tokens=max_completion_tokens,
+                temperature=temperature,
+                response_mime_type=response_mime_type
+            )
+        else:
+            out=call_groq_text(
+                groq_client=groq_client,
+                prompt=prompt,
+                max_completion_tokens=max_completion_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                stream=stream
+            )
+        if out:
+            return out
+    return ""
+
 def generate_ai_summary(groq_client, main_text, comments_text, root_user_id=None):
     if not comments_text:
         return "Sin comentarios en el hilo. Conclusión: Sin información suficiente."
-    if groq_client is None:
-        return "No se pudo generar resumen IA (sin cliente Groq). Conclusión: Sin información suficiente."
+    if groq_client is None and not gemini_api_key:
+        return "No se pudo generar resumen IA (sin cliente de IA). Conclusión: Sin información suficiente."
 
     root_author=get_user_label(root_user_id)
     prompt=(
@@ -667,25 +756,15 @@ def generate_ai_summary(groq_client, main_text, comments_text, root_user_id=None
     )
 
     try:
-        completion=groq_client.chat.completions.create(
-            model=groq_model,
-            messages=[
-                {
-                    "role":"user",
-                    "content":prompt
-                }
-            ],
+        llm_output=generate_llm_text(
+            groq_client=groq_client,
+            prompt=prompt,
             temperature=0.6,
             max_completion_tokens=4096,
             top_p=0.95,
-            reasoning_effort="default",
-            stream=True,
-            stop=None
+            stream=True
         )
-        output=[]
-        for chunk in completion:
-            output.append(chunk.choices[0].delta.content or "")
-        summary=normalize_ai_summary("".join(output))
+        summary=normalize_ai_summary(llm_output)
         if summary:
             return summary[:4997]+"..." if len(summary)>5000 else summary
     except Exception as e:
@@ -723,7 +802,7 @@ def generate_ai_status(groq_client, main_text, comments_text):
     fallback_status=infer_auto_status(main_text)
     if is_incident_like(f"{main_text or ''} {comments_text or ''}"):
         return ""
-    if groq_client is None:
+    if groq_client is None and not gemini_api_key:
         return fallback_status
 
     prompt=(
@@ -743,25 +822,15 @@ def generate_ai_status(groq_client, main_text, comments_text):
     )
 
     try:
-        completion=groq_client.chat.completions.create(
-            model=groq_model,
-            messages=[
-                {
-                    "role":"user",
-                    "content":prompt
-                }
-            ],
+        llm_output=generate_llm_text(
+            groq_client=groq_client,
+            prompt=prompt,
             temperature=0,
             max_completion_tokens=64,
             top_p=1,
-            reasoning_effort="default",
-            stream=True,
-            stop=None
+            stream=False
         )
-        output=[]
-        for chunk in completion:
-            output.append(chunk.choices[0].delta.content or "")
-        ai_status=normalize_ai_status_output("".join(output))
+        ai_status=normalize_ai_status_output(llm_output)
         if is_incident_like(f"{main_text or ''} {comments_text or ''}"):
             return ""
         if ai_status in {"IDEA", "Anuncio/Agradecimiento", ""}:
@@ -955,9 +1024,9 @@ def parse_blackbox_classification_output(text):
 
 def generate_blackbox_classification(groq_client, main_text, comments_text):
     fallback=infer_blackbox_classification(main_text, comments_text)
-    if groq_client is None:
+    if groq_client is None and not gemini_api_key:
         if strict_md_classification:
-            print("[WARN] Modo estricto .md: sin cliente Groq, usando clasificador determinístico basado en guía.")
+            print("[WARN] Modo estricto .md: sin cliente de IA, usando clasificador determinístico basado en guía.")
         return fallback
 
     guide_text=get_blackbox_guide_excerpt()
@@ -989,17 +1058,15 @@ def generate_blackbox_classification(groq_client, main_text, comments_text):
         )
 
     def request_payload(prompt_text):
-        completion=groq_client.chat.completions.create(
-            model=groq_model,
-            messages=[{"role":"user","content":prompt_text}],
+        content=generate_llm_text(
+            groq_client=groq_client,
+            prompt=prompt_text,
             temperature=0,
             max_completion_tokens=256,
             top_p=1,
-            reasoning_effort="default",
             stream=False,
-            stop=None
+            response_mime_type="application/json"
         )
-        content=completion.choices[0].message.content or ""
         return parse_blackbox_classification_output(content), content
 
     try:
